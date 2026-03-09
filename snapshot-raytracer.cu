@@ -1,6 +1,8 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <limits>
+#include <string>
 #include <omp.h>
 #include <hdf5.h>
 #include <hdf5_hl.h>
@@ -18,6 +20,68 @@
     } \
 } while(0)
 #endif
+
+constexpr double SPEED_OF_LIGHT_KM_PER_S = 299792.458;
+constexpr int RK4_REFINEMENT_STEPS = 24;
+constexpr double FINAL_Z_TOL = 1e-4;
+
+enum RayStateIndex : int {
+    STATE_X = 0,
+    STATE_Y,
+    STATE_Z,
+    STATE_NX,
+    STATE_NY,
+    STATE_NZ,
+    STATE_E1X,
+    STATE_E1Y,
+    STATE_E1Z,
+    STATE_E2X,
+    STATE_E2Y,
+    STATE_E2Z,
+    STATE_DA,
+    STATE_DA_PRIME,
+    STATE_SIGMA1,
+    STATE_SIGMA2,
+    STATE_ELLIPTICITY1,
+    STATE_ELLIPTICITY2,
+    STATE_ROTATION,
+    STATE_LOG_KTILDE0,
+    STATE_BACKGROUND_Z,
+    STATE_SIZE
+};
+
+struct RayIntegrationConfig {
+    double target_z;
+    double cell_size_mpc;
+    double h0_over_c;
+    double omega_m;
+    double omega_lambda;
+    int max_steps;
+};
+
+__host__ __device__ inline double background_e(const RayIntegrationConfig& config, double z) {
+    return std::sqrt(config.omega_m * std::pow(1.0 + z, 3.0) + config.omega_lambda);
+}
+
+__host__ __device__ inline double background_a_from_state(const double y[STATE_SIZE]) {
+    return 1.0 / (1.0 + y[STATE_BACKGROUND_Z]);
+}
+
+double comoving_distance_mpc(double target_z, double omega_m, double omega_lambda, double h0_over_c) {
+    if (target_z <= 0.0) {
+        return 0.0;
+    }
+
+    const int intervals = 4096;
+    const double dz = target_z / static_cast<double>(intervals);
+    double integral = 0.0;
+    for (int i = 0; i <= intervals; ++i) {
+        const double z = dz * static_cast<double>(i);
+        const double weight = (i == 0 || i == intervals) ? 1.0 : (i % 2 == 0 ? 2.0 : 4.0);
+        integral += weight / std::sqrt(omega_m * std::pow(1.0 + z, 3.0) + omega_lambda);
+    }
+    return integral * dz / (3.0 * h0_over_c);
+}
 
 // HDF5 Array Loader
 std::vector<float> load_hdf5_array(const std::string& filename, const std::string& datasetname,
@@ -311,30 +375,43 @@ __host__ __device__ float tricubic_interpolation(const T * data, const int * dim
     return cubic_cr(tmp_z, dz);
 }
 
-// Helper function to do the raytracing with GSL ODE solver
-__host__ __device__ void raytracing_ode(double t, const double y[], double dydt[], const float* data, const __half * B1data, const __half * B2data, const __half * B3data, const int * dims) {
-    // Unpack the state vector
-    const double x_pos = y[0];
-    const double y_pos = y[1];
-    const double z_pos = y[2];
-    double nx = y[3];
-    double ny = y[4];
-    double nz = y[5];
-    double e1x = y[6];
-    double e1y = y[7];
-    double e1z = y[8];
-    double e2x = y[9];
-    double e2y = y[10];
-    double e2z = y[11];
-    const double dA = y[12];
-    const double dAprime = y[13];
-    const double sigma1 = y[14];
-    const double sigma2 = y[15];
-    const double ellipticity1 = y[16];
-    const double ellipticity2 = y[17];
-    //const double rotation = y[18];
+__host__ __device__ inline void copy_state(double dst[STATE_SIZE], const double src[STATE_SIZE]) {
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        dst[i] = src[i];
+    }
+}
 
-    // Normalize n, e1 and e2
+__host__ __device__ double observed_redshift_from_state(const double y[STATE_SIZE], const float* data, const int * dims) {
+    float grad[3];
+    float hessian[3][3];
+    const float phi = tricubic_interpolation(data, dims, y[STATE_X], y[STATE_Y], y[STATE_Z], grad, hessian);
+    const double one_plus_z = std::exp(3.0 * static_cast<double>(phi) + y[STATE_LOG_KTILDE0]) / background_a_from_state(y);
+    return one_plus_z - 1.0;
+}
+
+__host__ __device__ void raytracing_ode(const double y[STATE_SIZE], double dydt[STATE_SIZE], const float* data,
+                                        const __half * B1data, const __half * B2data, const __half * B3data,
+                                        const int * dims, const RayIntegrationConfig& config) {
+    const double x_pos = y[STATE_X];
+    const double y_pos = y[STATE_Y];
+    const double z_pos = y[STATE_Z];
+    double nx = y[STATE_NX];
+    double ny = y[STATE_NY];
+    double nz = y[STATE_NZ];
+    double e1x = y[STATE_E1X];
+    double e1y = y[STATE_E1Y];
+    double e1z = y[STATE_E1Z];
+    double e2x = y[STATE_E2X];
+    double e2y = y[STATE_E2Y];
+    double e2z = y[STATE_E2Z];
+    const double dA = y[STATE_DA];
+    const double dAprime = y[STATE_DA_PRIME];
+    const double sigma1 = y[STATE_SIGMA1];
+    const double sigma2 = y[STATE_SIGMA2];
+    const double ellipticity1 = y[STATE_ELLIPTICITY1];
+    const double ellipticity2 = y[STATE_ELLIPTICITY2];
+
     double norm = std::sqrt(nx * nx + ny * ny + nz * nz);
     nx /= norm;
     ny /= norm;
@@ -366,7 +443,6 @@ __host__ __device__ void raytracing_ode(double t, const double y[], double dydt[
         {e1x * e2z + e1z * e2x, e1y * e2z + e1z * e2y, 2 * e1z * e2z}
     };
 
-    // Compute the gradient and hessian
     float grad[3];
     float ngradB[3];
     float hessian[3][3];
@@ -459,27 +535,29 @@ __host__ __device__ void raytracing_ode(double t, const double y[], double dydt[
     e2gradB[1] += -0.5 * e2z * grad[1];
     e2gradB[2] += 0.5 * (e2x * grad[0] + e2y * grad[1]);
 
-    float phi = tricubic_interpolation(data, dims, x_pos, y_pos, z_pos, grad, hessian);
+    const float phi = tricubic_interpolation(data, dims, x_pos, y_pos, z_pos, grad, hessian);
+    const double exp_2phi = std::exp(2.0 * static_cast<double>(phi));
+    const double n_dot_grad_phi = nx * grad[0] + ny * grad[1] + nz * grad[2];
+    const double dlogktilde_dt = 4.0 * exp_2phi * n_dot_grad_phi + nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2];
 
-    // Compute the derivatives
-    dydt[0] = -nx * (1 + 2 * phi) - Bx;
-    dydt[1] = -ny * (1 + 2 * phi) - By;
-    dydt[2] = -nz * (1 + 2 * phi) - Bz;
+    dydt[STATE_X] = -nx * exp_2phi - Bx;
+    dydt[STATE_Y] = -ny * exp_2phi - By;
+    dydt[STATE_Z] = -nz * exp_2phi - Bz;
 
-    dydt[3] = -(transverse_projector[0][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[0][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[0][2] * (2 * grad[2] + ngradB[2]));
-    dydt[4] = -(transverse_projector[1][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[1][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[1][2] * (2 * grad[2] + ngradB[2]));
-    dydt[5] = -(transverse_projector[2][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[2][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[2][2] * (2 * grad[2] + ngradB[2]));
+    dydt[STATE_NX] = -(transverse_projector[0][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[0][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[0][2] * (2 * grad[2] + ngradB[2]));
+    dydt[STATE_NY] = -(transverse_projector[1][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[1][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[1][2] * (2 * grad[2] + ngradB[2]));
+    dydt[STATE_NZ] = -(transverse_projector[2][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[2][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[2][2] * (2 * grad[2] + ngradB[2]));
 
-    dydt[6] = -2 * nx * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nx * e1ngradB;
-    dydt[7] = -2 * ny * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - ny * e1ngradB;
-    dydt[8] = -2 * nz * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nz * e1ngradB;
+    dydt[STATE_E1X] = -2 * nx * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nx * e1ngradB;
+    dydt[STATE_E1Y] = -2 * ny * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - ny * e1ngradB;
+    dydt[STATE_E1Z] = -2 * nz * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nz * e1ngradB;
 
-    dydt[9] = -2 * nx * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nx * e2ngradB;
-    dydt[10] = -2 * ny * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - ny * e2ngradB;
-    dydt[11] = -2 * nz * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nz * e2ngradB;
+    dydt[STATE_E2X] = -2 * nx * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nx * e2ngradB;
+    dydt[STATE_E2Y] = -2 * ny * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - ny * e2ngradB;
+    dydt[STATE_E2Z] = -2 * nz * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nz * e2ngradB;
 
-    dydt[12] = -dAprime;
-    dydt[13] = -4 * dAprime * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) - (transverse_projector[0][0] * hessian[0][0] + transverse_projector[0][1] * hessian[0][1] + transverse_projector[0][2] * hessian[0][2] + transverse_projector[1][0] * hessian[1][0] + transverse_projector[1][1] * hessian[1][1] + transverse_projector[1][2] * hessian[1][2] + transverse_projector[2][0] * hessian[2][0] + transverse_projector[2][1] * hessian[2][1] + transverse_projector[2][2] * hessian[2][2]) * dA + 0.5 * nLaplaceB * dA;
+    dydt[STATE_DA] = -dAprime;
+    dydt[STATE_DA_PRIME] = -4 * dAprime * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) - (transverse_projector[0][0] * hessian[0][0] + transverse_projector[0][1] * hessian[0][1] + transverse_projector[0][2] * hessian[0][2] + transverse_projector[1][0] * hessian[1][0] + transverse_projector[1][1] * hessian[1][1] + transverse_projector[1][2] * hessian[1][2] + transverse_projector[2][0] * hessian[2][0] + transverse_projector[2][1] * hessian[2][1] + transverse_projector[2][2] * hessian[2][2]) * dA + 0.5 * nLaplaceB * dA;
 
     hessian[0][0] += 0.5 * tidalBterm[0][0];
     hessian[0][1] += 0.5 * tidalBterm[0][1];
@@ -491,95 +569,161 @@ __host__ __device__ void raytracing_ode(double t, const double y[], double dydt[
     hessian[2][1] += 0.5 * tidalBterm[2][1];
     hessian[2][2] += 0.5 * tidalBterm[2][2];
 
-    dydt[14] = 4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
-    dydt[15] = 4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
+    dydt[STATE_SIGMA1] = 4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
+    dydt[STATE_SIGMA2] = 4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
 
     if (dA > 0.5)
     {
-        dydt[13] += (sigma1 * sigma1 + sigma2 * sigma2) / (dA * dA * dA);
-        dydt[16] = -2 * sigma1 * std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2) / (dA * dA);
-        dydt[17] = -2 * sigma2 * std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2) / (dA * dA);
-        dydt[18] = -(sigma1 * ellipticity2 - sigma2 * ellipticity1) / (dA * dA * (2 + std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2)));
+        dydt[STATE_DA_PRIME] += (sigma1 * sigma1 + sigma2 * sigma2) / (dA * dA * dA);
+        dydt[STATE_ELLIPTICITY1] = -2 * sigma1 * std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2) / (dA * dA);
+        dydt[STATE_ELLIPTICITY2] = -2 * sigma2 * std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2) / (dA * dA);
+        dydt[STATE_ROTATION] = -(sigma1 * ellipticity2 - sigma2 * ellipticity1) / (dA * dA * (2 + std::sqrt(4 + ellipticity1 * ellipticity1 + ellipticity2 * ellipticity2)));
     }
     else
     {
-        dydt[16] = 0;
-        dydt[17] = 0;
-        dydt[18] = 0;
+        dydt[STATE_ELLIPTICITY1] = 0;
+        dydt[STATE_ELLIPTICITY2] = 0;
+        dydt[STATE_ROTATION] = 0;
+    }
+
+    dydt[STATE_LOG_KTILDE0] = dlogktilde_dt;
+    dydt[STATE_BACKGROUND_Z] = config.cell_size_mpc * config.h0_over_c * background_e(config, y[STATE_BACKGROUND_Z]);
+}
+
+__host__ __device__ void rk4_step(const float * data, const __half * B1data, const __half * B2data, const __half * B3data,
+                                  const int * dims, double y[STATE_SIZE], double dt, const RayIntegrationConfig& config) {
+    double temp[STATE_SIZE];
+    double k1[STATE_SIZE];
+    double k2[STATE_SIZE];
+    double k3[STATE_SIZE];
+    double k4[STATE_SIZE];
+
+    raytracing_ode(y, k1, data, B1data, B2data, B3data, dims, config);
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        temp[i] = y[i] + 0.5 * dt * k1[i];
+    }
+
+    raytracing_ode(temp, k2, data, B1data, B2data, B3data, dims, config);
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        temp[i] = y[i] + 0.5 * dt * k2[i];
+    }
+
+    raytracing_ode(temp, k3, data, B1data, B2data, B3data, dims, config);
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        temp[i] = y[i] + dt * k3[i];
+    }
+
+    raytracing_ode(temp, k4, data, B1data, B2data, B3data, dims, config);
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        y[i] += (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
     }
 }
 
-// Raytracing function
-__host__ __device__ void raytracing(const float * data, const __half * B1data, const __half * B2data, const __half * B3data, const int * dims, double y[19], int n_steps) {
+__host__ __device__ bool raytracing(const float * data, const __half * B1data, const __half * B2data, const __half * B3data,
+                                    const int * dims, const RayIntegrationConfig& config, double y[STATE_SIZE], double* reached_z) {
+    double previous_state[STATE_SIZE];
+    double refined_state[STATE_SIZE];
+    double last_reached_z = observed_redshift_from_state(y, data, dims);
 
-    // Initial state vector
-
-    // temporary arrays for RK4 integration
-    double temp[19], k[19], kacc[19];
-
-    // Time variable
-    double t = 0.0;
-
-    // Perform the RK4 integration
-    for (int i = 0; i < n_steps; ++i) {
-        //int status = gsl_odeiv2_driver_apply(d, &t, t + 1.0, y);
-        raytracing_ode(t, y, kacc, data, B1data, B2data, B3data, dims);
-        #pragma unroll
-        for (int j = 0; j < 19; ++j) {
-            temp[j] = y[j] + 0.5 * kacc[j];
-        }
-        raytracing_ode(t + 0.5, temp, k, data, B1data, B2data, B3data, dims);
-        #pragma unroll
-        for (int j = 0; j < 19; ++j) {
-            temp[j] = y[j] + 0.5 * k[j];
-            kacc[j] += 2 * k[j];
-        }
-        raytracing_ode(t + 1.0, temp, k, data, B1data, B2data, B3data, dims);
-        #pragma unroll
-        for (int j = 0; j < 19; ++j) {
-            temp[j] = y[j] + k[j];
-            kacc[j] += 2 * k[j];
-        }
-        raytracing_ode(t + 1.0, temp, k, data, B1data, B2data, B3data, dims);
-        #pragma unroll
-        for (int j = 0; j < 19; ++j) {
-            y[j] += (kacc[j] + k[j]) / 6.0;
-        }
-        t += 1.0; // advance time (system is autonomous, but keeps semantics clear)
+    if (last_reached_z >= config.target_z) {
+        *reached_z = last_reached_z;
+        return true;
     }
+
+    for (int step = 0; step < config.max_steps; ++step) {
+        copy_state(previous_state, y);
+        const double previous_z = last_reached_z;
+        rk4_step(data, B1data, B2data, B3data, dims, y, 1.0, config);
+        last_reached_z = observed_redshift_from_state(y, data, dims);
+
+        if (last_reached_z >= config.target_z) {
+            double low = 0.0;
+            double high = 1.0;
+            copy_state(refined_state, y);
+            for (int iter = 0; iter < RK4_REFINEMENT_STEPS && std::fabs(last_reached_z - config.target_z) > FINAL_Z_TOL; ++iter) {
+                const double mid = 0.5 * (low + high);
+                copy_state(refined_state, previous_state);
+                rk4_step(data, B1data, B2data, B3data, dims, refined_state, mid, config);
+                const double mid_z = observed_redshift_from_state(refined_state, data, dims);
+                if (mid_z >= config.target_z) {
+                    high = mid;
+                    copy_state(y, refined_state);
+                    last_reached_z = mid_z;
+                }
+                else {
+                    low = mid;
+                }
+            }
+            *reached_z = last_reached_z;
+            return true;
+        }
+
+        if (last_reached_z < previous_z) {
+            break;
+        }
+    }
+
+    *reached_z = last_reached_z;
+    return false;
 }
 
 __global__ void raytracing_kernel(const float * data, const __half * B1data, const __half * B2data, const __half * B3data, const int * dims, const int64_t Nside,
-    const int64_t iend, const int n_steps, double * thetamap, double * phimap,
+    const int64_t iend, const RayIntegrationConfig config, double * thetamap, double * phimap,
     float * dAmap, float * ellipticity1map, float * ellipticity2map,
-    float * rotationmap, float * deflection1map, float * deflection2map) {
+    float * rotationmap, float * deflection1map, float * deflection2map, float * zmap) {
     
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= iend) return;
 
-    double y[19] = { static_cast<double>(dims[0]) * 0.5, static_cast<double>(dims[1]) * 0.5, static_cast<double>(dims[2]) * 0.5, -std::sin(thetamap[i]) * std::cos(phimap[i]), -std::sin(thetamap[i]) * std::sin(phimap[i]), -std::cos(thetamap[i]), std::cos(thetamap[i]) * std::cos(phimap[i]), std::cos(thetamap[i]) * std::sin(phimap[i]), -std::sin(thetamap[i]), std::sin(phimap[i]), -std::cos(phimap[i]), 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
-    
-    // Perform raytracing
-    raytracing(data, B1data, B2data, B3data, dims, y, n_steps);
+    double y[STATE_SIZE] = {
+        static_cast<double>(dims[0]) * 0.5, static_cast<double>(dims[1]) * 0.5, static_cast<double>(dims[2]) * 0.5,
+        -std::sin(thetamap[i]) * std::cos(phimap[i]), -std::sin(thetamap[i]) * std::sin(phimap[i]), -std::cos(thetamap[i]),
+        std::cos(thetamap[i]) * std::cos(phimap[i]), std::cos(thetamap[i]) * std::sin(phimap[i]), -std::sin(thetamap[i]),
+        std::sin(phimap[i]), -std::cos(phimap[i]), 0.0,
+        0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    };
 
-    // compute deflection angle
-    y[0] -= static_cast<double>(dims[0]) * 0.5;
-    y[1] -= static_cast<double>(dims[1]) * 0.5;
-    y[2] -= static_cast<double>(dims[2]) * 0.5;
+    float grad[3];
+    float hessian[3][3];
+    const float phi_observer = tricubic_interpolation(data, dims, y[STATE_X], y[STATE_Y], y[STATE_Z], grad, hessian);
+    y[STATE_LOG_KTILDE0] = -3.0 * static_cast<double>(phi_observer);
+    y[STATE_BACKGROUND_Z] = 0.0;
 
-    double norm = std::sqrt(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+    double reached_z = 0.0;
+    const bool reached_target = raytracing(data, B1data, B2data, B3data, dims, config, y, &reached_z);
+    zmap[i] = static_cast<float>(reached_z);
 
-    y[0] = y[0] / norm - std::sin(thetamap[i]) * std::cos(phimap[i]);
-    y[1] = y[1] / norm - std::sin(thetamap[i]) * std::sin(phimap[i]);
-    y[2] = y[2] / norm - std::cos(thetamap[i]);
+    if (!reached_target) {
+        const float nan_value = nanf("");
+        dAmap[i] = nan_value;
+        ellipticity1map[i] = nan_value;
+        ellipticity2map[i] = nan_value;
+        rotationmap[i] = nan_value;
+        deflection1map[i] = nan_value;
+        deflection2map[i] = nan_value;
+        return;
+    }
 
-    // Store the results
-    dAmap[i] = static_cast<float>(y[12]);
-    ellipticity1map[i] = static_cast<float>(y[16]);
-    ellipticity2map[i] = static_cast<float>(y[17]);
-    rotationmap[i] = static_cast<float>(y[18]);
-    deflection1map[i] = static_cast<float>(y[0] * std::cos(thetamap[i]) * std::cos(phimap[i]) + y[1] * std::cos(thetamap[i]) * std::sin(phimap[i]) - y[2] * std::sin(thetamap[i]));
-    deflection2map[i] = static_cast<float>(y[0] * std::sin(phimap[i]) - y[1] * std::cos(phimap[i]));
+    y[STATE_X] -= static_cast<double>(dims[0]) * 0.5;
+    y[STATE_Y] -= static_cast<double>(dims[1]) * 0.5;
+    y[STATE_Z] -= static_cast<double>(dims[2]) * 0.5;
+
+    double norm = std::sqrt(y[STATE_X] * y[STATE_X] + y[STATE_Y] * y[STATE_Y] + y[STATE_Z] * y[STATE_Z]);
+
+    y[STATE_X] = y[STATE_X] / norm - std::sin(thetamap[i]) * std::cos(phimap[i]);
+    y[STATE_Y] = y[STATE_Y] / norm - std::sin(thetamap[i]) * std::sin(phimap[i]);
+    y[STATE_Z] = y[STATE_Z] / norm - std::cos(thetamap[i]);
+
+    dAmap[i] = static_cast<float>(y[STATE_DA]);
+    ellipticity1map[i] = static_cast<float>(y[STATE_ELLIPTICITY1]);
+    ellipticity2map[i] = static_cast<float>(y[STATE_ELLIPTICITY2]);
+    rotationmap[i] = static_cast<float>(y[STATE_ROTATION]);
+    deflection1map[i] = static_cast<float>(y[STATE_X] * std::cos(thetamap[i]) * std::cos(phimap[i]) + y[STATE_Y] * std::cos(thetamap[i]) * std::sin(phimap[i]) - y[STATE_Z] * std::sin(thetamap[i]));
+    deflection2map[i] = static_cast<float>(y[STATE_X] * std::sin(phimap[i]) - y[STATE_Y] * std::cos(phimap[i]));
 }
 
 __global__ void vector3_to_half(const float * vec3, __half * h1, __half * h2, __half * h3, int64_t n, int64_t xy, int64_t offset) {
@@ -598,44 +742,83 @@ __global__ void vector3_to_half(const float * vec3, __half * h1, __half * h2, __
 
 // Main function
 int main(int argc, char* argv[]) {
-    // Check command line arguments
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <hdf5_file_potential> <hdf5_file_B> <Nside> <n_steps> [<batch>]" << std::endl;
-        std::cerr << "  <hdf5_file_potential>: HDF5 file containing a snapshot of the Weyl potential" << std::endl;
-        std::cerr << "  <hdf5_file_B>: HDF5 file containing a snapshot of the frame-dragging potential (shift)" << std::endl;
-        std::cerr << "  <Nside>: HEALPix Nside parameter for output maps" << std::endl;
-        std::cerr << "  <n_steps>: Number of integration steps for raytracing (1 step = 1 grid unit)" << std::endl;
-        std::cerr << "  [<batch>]: Optional batch index for processing a subset of pixels" << std::endl;
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " <hdf5_file_potential> <hdf5_file_B> <Nside>"
+                  << " --target-z <z> --box-size-mpc <L> --omega-m <Om> --omega-lambda <Ol> --h0 <km/s/Mpc> [--batch <n>]" << std::endl;
         return -1;
     }
 
+    const std::string potential_filename = argv[1];
+    const std::string b_filename = argv[2];
     int64_t Nside = std::stol(argv[3]);
     if (Nside <= 0) {
         std::cerr << "Invalid Nside value: " << Nside << std::endl;
         return -1;
     }
 
-    int n_steps = std::stoi(argv[4]);
-    if (n_steps <= 0) {
-        std::cerr << "Invalid n_steps value: " << n_steps << std::endl;
-        return -1;
-    }
-
+    double target_z = -1.0;
+    double box_size_mpc = -1.0;
+    double omega_m = -1.0;
+    double omega_lambda = -1.0;
+    double h0 = -1.0;
     int batch = -1;
-    if (argc > 5) {
-        batch = std::stoi(argv[5]);
-        if (batch < 0) {
-            std::cerr << "Invalid batch value: " << batch << std::endl;
+
+    for (int argi = 4; argi < argc; ++argi) {
+        const std::string arg = argv[argi];
+        if (arg == "--target-z" && argi + 1 < argc) {
+            target_z = std::stod(argv[++argi]);
+        }
+        else if (arg == "--box-size-mpc" && argi + 1 < argc) {
+            box_size_mpc = std::stod(argv[++argi]);
+        }
+        else if (arg == "--omega-m" && argi + 1 < argc) {
+            omega_m = std::stod(argv[++argi]);
+        }
+        else if (arg == "--omega-lambda" && argi + 1 < argc) {
+            omega_lambda = std::stod(argv[++argi]);
+        }
+        else if (arg == "--h0" && argi + 1 < argc) {
+            h0 = std::stod(argv[++argi]);
+        }
+        else if (arg == "--batch" && argi + 1 < argc) {
+            batch = std::stoi(argv[++argi]);
+        }
+        else {
+            std::cerr << "Unknown or incomplete option: " << arg << std::endl;
             return -1;
         }
     }
 
-    std::cout << "Nside: " << Nside << std::endl;
-    std::cout << "n_steps: " << n_steps << std::endl;
-    std::cout << "Loading potential data from HDF5 file " << argv[1] << " ..." << std::endl;
+    if (target_z <= 0.0) {
+        std::cerr << "Invalid --target-z value: " << target_z << std::endl;
+        return -1;
+    }
+    if (box_size_mpc <= 0.0) {
+        std::cerr << "Invalid --box-size-mpc value: " << box_size_mpc << std::endl;
+        return -1;
+    }
+    if (omega_m < 0.0 || omega_lambda < 0.0) {
+        std::cerr << "Invalid cosmology; omega values must be non-negative." << std::endl;
+        return -1;
+    }
+    if (h0 <= 0.0) {
+        std::cerr << "Invalid --h0 value: " << h0 << std::endl;
+        return -1;
+    }
+    if (batch < -1) {
+        std::cerr << "Invalid batch value: " << batch << std::endl;
+        return -1;
+    }
 
-    // Load the HDF5 file
-    std::string filename = argv[1];
+    std::cout << "Nside: " << Nside << std::endl;
+    std::cout << "target_z: " << target_z << std::endl;
+    std::cout << "box_size_mpc: " << box_size_mpc << std::endl;
+    std::cout << "omega_m: " << omega_m << std::endl;
+    std::cout << "omega_lambda: " << omega_lambda << std::endl;
+    std::cout << "h0: " << h0 << " km/s/Mpc" << std::endl;
+    std::cout << "Loading potential data from HDF5 file " << potential_filename << " ..." << std::endl;
+
+    std::string filename = potential_filename;
     std::vector<hsize_t> dims;
     std::vector<float> data = load_hdf5_array(filename, "/data", dims);
     if (data.empty()) {
@@ -660,6 +843,21 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    RayIntegrationConfig ray_config{};
+    ray_config.target_z = target_z;
+    ray_config.cell_size_mpc = box_size_mpc / static_cast<double>(dims[0]);
+    ray_config.h0_over_c = h0 / SPEED_OF_LIGHT_KM_PER_S;
+    ray_config.omega_m = omega_m;
+    ray_config.omega_lambda = omega_lambda;
+    const double chi_target_mpc = comoving_distance_mpc(target_z, omega_m, omega_lambda, ray_config.h0_over_c);
+    ray_config.max_steps = static_cast<int>(std::ceil(chi_target_mpc / ray_config.cell_size_mpc)) + 32;
+    if (ray_config.max_steps <= 0) {
+        ray_config.max_steps = 32;
+    }
+
+    std::cout << "cell_size_mpc: " << ray_config.cell_size_mpc << std::endl;
+    std::cout << "internal_max_steps: " << ray_config.max_steps << std::endl;
+
 #ifdef RESCALE_DATA
     // rescale the data by constant factor RESCALE_DATA
     std::cout << "Rescaling potential data by factor " << RESCALE_DATA << std::endl;
@@ -669,10 +867,9 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    std::cout << "Loading B field data from HDF5 file " << argv[2] << " ..." << std::endl;
+    std::cout << "Loading B field data from HDF5 file " << b_filename << " ..." << std::endl;
 
-    // Load the HDF5 file
-    filename = argv[2];
+    filename = b_filename;
     std::vector<float> Bdata = load_hdf5_vector_field(filename, "/data", dims);
     if (Bdata.empty()) {
         return -1;
@@ -696,6 +893,7 @@ int main(int argc, char* argv[]) {
     float * rotationmap_device = nullptr;
     float * deflection1map_device = nullptr;
     float * deflection2map_device = nullptr;
+    float * zmap_device = nullptr;
 
     float * data_device = nullptr;
     int * dims_device = nullptr;
@@ -746,6 +944,11 @@ int main(int argc, char* argv[]) {
     success = cudaMalloc(&deflection2map_device, iend * sizeof(float));
     if (success != cudaSuccess) {
         std::cerr << "Failed to allocate device memory for deflection2map: " << cudaGetErrorString(success) << std::endl;
+        return -1;
+    }
+    success = cudaMalloc(&zmap_device, iend * sizeof(float));
+    if (success != cudaSuccess) {
+        std::cerr << "Failed to allocate device memory for zmap: " << cudaGetErrorString(success) << std::endl;
         return -1;
     }
 
@@ -893,12 +1096,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Launching raytracing kernel..." << std::endl;
 
-    // Launch the kernel
     blocks = (iend + threads_per_block - 1) / threads_per_block;
-    raytracing_kernel<<<blocks, threads_per_block>>>(data_device, B1_device, B2_device, B3_device, dims_device, Nside, iend, n_steps,
+    raytracing_kernel<<<blocks, threads_per_block>>>(data_device, B1_device, B2_device, B3_device, dims_device, Nside, iend, ray_config,
         thetamap_device, phimap_device,
         dAmap_device, ellipticity1map_device, ellipticity2map_device,
-        rotationmap_device, deflection1map_device, deflection2map_device);
+        rotationmap_device, deflection1map_device, deflection2map_device, zmap_device);
 
     success = cudaGetLastError();
     if (success != cudaSuccess) {
@@ -918,6 +1120,9 @@ int main(int argc, char* argv[]) {
     cudaFree(phimap_device);
     cudaFree(data_device);
     cudaFree(dims_device);
+    cudaFree(B1_device);
+    cudaFree(B2_device);
+    cudaFree(B3_device);
 
     // Save the results to FITS files
     
@@ -986,6 +1191,14 @@ int main(int argc, char* argv[]) {
     }
     write_healpix_map(outmap, Nside, filename_buffer, 0, "C");
 
+    snprintf(filename_buffer, sizeof(filename_buffer), "zmap_batch%d.fits", batch);
+    success = cudaMemcpy(outmap + istart, zmap_device, iend * sizeof(float), cudaMemcpyDeviceToHost);
+    if (success != cudaSuccess) {
+        std::cerr << "Failed to copy zmap to host: " << cudaGetErrorString(success) << std::endl;
+        return -1;
+    }
+    write_healpix_map(outmap, Nside, filename_buffer, 0, "C");
+
     // Free the output map
     free(outmap);
 
@@ -996,6 +1209,7 @@ int main(int argc, char* argv[]) {
     cudaFree(rotationmap_device);
     cudaFree(deflection1map_device);
     cudaFree(deflection2map_device);
+    cudaFree(zmap_device);
 
     // Free the data array
     data.clear();
