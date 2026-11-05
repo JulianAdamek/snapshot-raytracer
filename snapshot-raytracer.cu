@@ -636,7 +636,7 @@ __host__ __device__ bool raytracing(const float * data, const __half * B1data, c
 
     for (int step = 0; step < config.max_steps; ++step) {
         copy_state(previous_state, y);
-        const double previous_z = last_reached_z;
+        // const double previous_z = last_reached_z;
         rk4_step(data, B1data, B2data, B3data, dims, y, 1.0, config);
         last_reached_z = observed_redshift_from_state(y, data, dims);
 
@@ -662,9 +662,11 @@ __host__ __device__ bool raytracing(const float * data, const __half * B1data, c
             return true;
         }
 
-        if (last_reached_z < previous_z) {
-            break;
-        }
+        // A temporary gravitational blueshift can decrease the observed redshift.
+        // The max_steps limit still bounds integration if the target is not reached.
+        // if (last_reached_z < previous_z) {
+        //     break;
+        // }
     }
 
     *reached_z = last_reached_z;
