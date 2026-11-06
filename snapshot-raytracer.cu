@@ -569,8 +569,10 @@ __host__ __device__ void raytracing_ode(const double y[STATE_SIZE], double dydt[
     hessian[2][1] += 0.5 * tidalBterm[2][1];
     hessian[2][2] += 0.5 * tidalBterm[2][2];
 
-    dydt[STATE_SIGMA1] = 4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
-    dydt[STATE_SIGMA2] = 4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
+    // Backward transport: d(sigma)/ds = -d(log ktilde0)/ds * sigma + tidal source.
+    // Ellipticity sign conventions do not change this homogeneous coefficient.
+    dydt[STATE_SIGMA1] = -4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
+    dydt[STATE_SIGMA2] = -4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
 
     if (dA > 0.5)
     {

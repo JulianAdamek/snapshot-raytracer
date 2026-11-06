@@ -1,0 +1,22 @@
+# Executables and object files.
+/snapshot-raytracer
+/lightcone-raytracer
+/tests/lightcone-tests
+/tests/lightcone-reference-tests
+/tests/lightcone-storage-tests
+/tests/lightcone-time-tests
+/tests/snapshot-reference.o
+/validation/validation-tools
+
+# Generated maps, validation results and logs.
+/output/
+/*map_batch*.fits
+/run-metrics.json
+/validation/results/
+/validation/__pycache__/
+/alps-build*.log
+/alps-validation-*.out
+
+# Local reference copies; the documentation links to their arXiv versions.
+/2002.04024v2.pdf
+/2603.24179v2.pdf

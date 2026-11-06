@@ -32,7 +32,41 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ $< $(HDF5_LIBS) -lchealpix $(LIBS)
 
-clean:
-	rm -f $(TARGET)
+lightcone-raytracer: lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp lightcone-raytracer.cu lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ lightcone-raytracer.cu lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
 
-.PHONY: all clean
+tests/lightcone-tests: tests/lightcone-tests.cpp lightcone_layout.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(CXX) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-tests.cpp lightcone.cpp lightcone_layout.cpp $(HDF5_LIBS) $(LIBS)
+
+tests/snapshot-reference.o: tests/snapshot-reference.cu tests/snapshot-reference.hpp snapshot-raytracer.cu
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(HDF5_CFLAGS) $(INCLUDES) -c -o $@ $<
+
+tests/lightcone-reference-tests: lightcone_layout.cpp tests/lightcone-reference-tests.cpp tests/snapshot-reference.o lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(OMP_FLAGS) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-reference-tests.cpp lightcone.cpp lightcone_layout.cpp tests/snapshot-reference.o $(HDF5_LIBS) -lchealpix $(LIBS)
+
+validation/validation-tools: lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp validation/validation-tools.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(CXX) -O2 -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ validation/validation-tools.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
+
+tests/lightcone-storage-tests: tests/lightcone-storage-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone.hpp lightcone_maps.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(CXX) -O2 -Wall -Wextra -Wno-unknown-pragmas -fopenmp -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-storage-tests.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
+
+tests/lightcone-time-tests: tests/lightcone-time-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(CXX) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-time-tests.cpp lightcone.cpp lightcone_layout.cpp $(HDF5_LIBS) $(LIBS)
+
+test-cpu: tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests
+	./tests/lightcone-tests
+	OMP_NUM_THREADS=4 ./tests/lightcone-storage-tests
+	./tests/lightcone-time-tests
+
+test-reference: tests/lightcone-reference-tests
+	./tests/lightcone-reference-tests
+
+test-validation: lightcone-raytracer validation/validation-tools
+	python3 validation/test_workflow.py
+
+test: test-cpu test-reference test-validation
+
+clean:
+	rm -f $(TARGET) lightcone-raytracer tests/lightcone-tests tests/lightcone-reference-tests tests/snapshot-reference.o tests/lightcone-storage-tests tests/lightcone-time-tests validation/validation-tools
+
+.PHONY: all clean test test-cpu test-reference test-validation
