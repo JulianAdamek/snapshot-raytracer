@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lccube_geometry.h" // Vendored gasgrd convention 1; no external checkout required.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -32,6 +33,8 @@ enum class Status : int {
 };
 const char* status_name(Status status);
 
+enum class GeometryConvention { Legacy, GasgrdV1 };
+const char* geometry_convention_name(GeometryConvention convention);
 struct Geometry {
     double vertex[3] = {0.0, 0.0, 0.0};
     double direction[3] = {0.0, 0.0, 1.0};
@@ -40,7 +43,10 @@ struct Geometry {
     bool radial_limit = false;
     double inner = 0.0;
     double outer = 0.0;
+    GeometryConvention convention = GeometryConvention::Legacy;
 };
+lcg::GeometryInfo read_geometry_info(const std::string& path);
+void require_geometry_grid(const lcg::GeometryInfo& info, int n);
 
 struct InfoRecord {
     std::int32_t cycle;
@@ -67,11 +73,16 @@ std::vector<InfoRecord> read_info(const std::string& path, int thickness);
 Metadata build_metadata(std::vector<InfoRecord> records, int thickness,
                         const Geometry& geometry);
 
+// Field zero is always the Weyl potential; Phi preserves the legacy filename.
+enum class ScalarSource { Phi, Weyl, PhiChi };
+const char* scalar_source_name(ScalarSource source);
+constexpr int CHI_FILE = 4;
+
 // Logical XYZ coordinates. The result is contiguous with X varying fastest.
 // An origin outside the cube is allowed; periodic reads are split into hyperslabs.
 class Reader {
 public:
-    Reader(std::string base, int thickness);
+    Reader(std::string base, int thickness, ScalarSource scalar = ScalarSource::Phi);
     ~Reader();
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
@@ -82,10 +93,14 @@ public:
                                   const std::int64_t origin[3], const int extent[3]) const;
     std::uint64_t bytes_read() const;
 private:
+    std::vector<float> read_file_region(int file, int slot,
+                                        const std::int64_t origin[3], const int extent[3]) const;
+    int file_count() const { return scalar_ == ScalarSource::PhiChi ? 5 : 4; }
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::string base_;
     int thickness_, n_ = 0;
+    ScalarSource scalar_ = ScalarSource::Phi;
 };
 
 // Origin/extent describe residency independently of the physical periodic cube.

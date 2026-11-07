@@ -91,6 +91,14 @@ binary sidecar has no header: each record contains int32 cycle followed by
 float64 tau, scale factor, particle inner/outer radii, and `T+1` metric shell
 boundaries, without struct padding (`4 + 8*(T+5)` bytes).
 
+`--geometry <base>_lccube_geometry.bin` imports exact geometry and selects the
+shared gasgrd convention-1 arithmetic. Without it, the legacy writer's wrapped
+position/shifted vertex and unfused operation order are used, with a warning that
+the original geometry/compiler arithmetic cannot be fully verified. Neither mode
+discards samples near shell boundaries. Footprint overlap remains warnings-only.
+See [geometry conventions](docs/lightcone-raytracer.md#shell-geometry-conventions)
+for the sidecar format, precision limits and scalar-input choices.
+
 Each slot is a collection of shells recorded at different times. The reader
 replays shell writes with later records taking precedence. At each RK4 stage it
 reconstructs a common-time value separately at every tricubic stencil node,

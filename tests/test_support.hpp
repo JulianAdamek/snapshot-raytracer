@@ -86,8 +86,9 @@ struct Fixture {
             for (int z = 0; z < n; ++z) for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) {
                 const auto& grid = grids[field*thickness+slot];
                 const double px = x+grid.node_offset[0], py = y+grid.node_offset[1], pz = z+grid.node_offset[2];
-                const double dx = px/n-geometry.vertex[0], dy = py/n-geometry.vertex[1], dz = pz/n-geometry.vertex[2];
-                const int record = lightcone::record_at(v, slot, std::sqrt(dx*dx+dy*dy+dz*dz));
+                const std::int64_t xyz[3] = {x, y, z};
+                bool cone;
+                const int record = lightcone::record_at(v, slot, lightcone::node_radius(v, grid, xyz, cone));
                 fields[field*thickness+slot][x+n*(y+n*z)] = record < 0 ? NAN :
                     function(field, metadata.times[record], px, py, pz);
             }

@@ -13,6 +13,9 @@ namespace lightcone {
 const char* time_derivative_name(TimeDerivativeMode mode) {
     return mode == TimeDerivativeMode::Zero ? "zero" : "finite-difference";
 }
+const char* geometry_convention_name(GeometryConvention convention) {
+    return convention == GeometryConvention::GasgrdV1 ? "gasgrd-v1" : "legacy";
+}
 namespace {
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -74,6 +77,28 @@ const char* status_name(Status s) {
         case Status::TargetNotReached: return "target not reached within time/refinement limits";
         default: return "unknown status";
     }
+}
+
+lcg::GeometryInfo read_geometry_info(const std::string& path) {
+    const auto g = lcg::read_geometry_binary(path);
+    require(g.thickness <= std::numeric_limits<int>::max()/4 &&
+            (g.b_collocated == 0 || g.b_collocated == 1) &&
+            (g.periodic_overlap == 0 || g.periodic_overlap == 1), "Invalid geometry flags or thickness");
+    for (int axis = 0; axis < 3; ++axis)
+        require(std::isfinite(g.vertex[axis]) && g.vertex[axis] >= 0.0 && g.vertex[axis] < 1.0 &&
+                std::isfinite(g.direction[axis]), "Invalid geometry vertex or direction");
+    const double norm = std::hypot(g.direction[0], g.direction[1], g.direction[2]);
+    require(std::isfinite(norm) && std::fabs(norm-1.0) <= 1e-12 &&
+            std::isfinite(g.opening_cos) && g.opening_cos >= -1.0 && g.opening_cos <= 1.0 &&
+            std::isfinite(g.distance_inner) && std::isfinite(g.distance_outer) &&
+            g.distance_inner >= 0.0 && g.distance_outer > g.distance_inner &&
+            std::isfinite(g.tauobs) && std::isfinite(g.boxsize) && g.boxsize > 0.0,
+            "Invalid geometry direction, footprint, observer time or box size");
+    // Do not normalize the direction or otherwise round any imported parameter.
+    return g;
+}
+void require_geometry_grid(const lcg::GeometryInfo& info, int n) {
+    require(info.n == n, "Grid size differs from the geometry file");
 }
 
 std::vector<InfoRecord> read_info(const std::string& path, int thickness) {
@@ -178,25 +203,39 @@ Metadata build_metadata(std::vector<InfoRecord> records, int thickness, const Ge
     return result;
 }
 
-struct Reader::Impl {
-    hid_t file = -1, data = -1, space = -1;
-    int field = -1, slot = -1;
-    std::size_t source_bytes = 0;
-    std::uint64_t bytes = 0;
-    void reset() {
-        if (space >= 0) H5Sclose(space);
-        if (data >= 0) H5Dclose(data);
-        if (file >= 0) H5Fclose(file);
-        file = data = space = -1;
-        field = slot = -1;
+const char* scalar_source_name(ScalarSource source) {
+    switch (source) {
+        case ScalarSource::Weyl: return "weyl";
+        case ScalarSource::PhiChi: return "phi-chi";
+        default: return "phi";
     }
-    ~Impl() { reset(); }
+}
+
+struct Reader::Impl {
+    // One cached open dataset for the scalar/B files and one for chi, so that combining
+    // phi and chi region by region does not reopen files for every region.
+    struct Handle {
+        hid_t file = -1, data = -1, space = -1;
+        int field = -1, slot = -1;
+        std::size_t source_bytes = 0;
+        void reset() {
+            if (space >= 0) H5Sclose(space);
+            if (data >= 0) H5Dclose(data);
+            if (file >= 0) H5Fclose(file);
+            file = data = space = -1;
+            field = slot = -1;
+        }
+        ~Handle() { reset(); }
+    };
+    Handle handles[2];
+    std::uint64_t bytes = 0;
 };
 Reader::~Reader() = default;
 std::uint64_t Reader::bytes_read() const { return impl_->bytes; }
-Reader::Reader(std::string base, int thickness) : impl_(std::make_unique<Impl>()), base_(std::move(base)), thickness_(thickness) {
+Reader::Reader(std::string base, int thickness, ScalarSource scalar)
+    : impl_(std::make_unique<Impl>()), base_(std::move(base)), thickness_(thickness), scalar_(scalar) {
     require(thickness > 0, "--thickness must be positive");
-    for (int field = 0; field < 4; ++field) for (int slot = 0; slot < thickness; ++slot) {
+    for (int field = 0; field < file_count(); ++field) for (int slot = 0; slot < thickness; ++slot) {
         const auto path = filename(field, slot);
         H5Handle file(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
         H5Handle data(H5Dopen2(file.id, "/data", H5P_DEFAULT), H5Dclose);
@@ -216,23 +255,37 @@ Reader::Reader(std::string base, int thickness) : impl_(std::make_unique<Impl>()
     volume(extent);
 }
 std::string Reader::filename(int field, int slot) const {
-    require(field >= 0 && field < 4 && slot >= 0 && slot < thickness_, "Invalid field or slot");
-    return base_ + (field == 0 ? "_phi" : "_B" + std::to_string(field)) +
-           (thickness_ == 1 ? "" : "_" + std::to_string(slot)) + ".h5";
+    require(field >= 0 && field < file_count() && slot >= 0 && slot < thickness_, "Invalid field or slot");
+    std::string name;
+    if (field == 0) name = scalar_ == ScalarSource::Weyl ? "_weyl" : "_phi";
+    else if (field == CHI_FILE) name = "_chi";
+    else name = "_B" + std::to_string(field);
+    return base_ + name + (thickness_ == 1 ? "" : "_" + std::to_string(slot)) + ".h5";
 }
 std::vector<float> Reader::read_region(int field, int slot, const std::int64_t origin[3], const int extent[3]) const {
+    require(field >= 0 && field < 4, "Invalid field");
+    auto result = read_file_region(field, slot, origin, extent);
+    if (field == 0 && scalar_ == ScalarSource::PhiChi) {
+        const auto chi = read_file_region(CHI_FILE, slot, origin, extent);
+        // Same single-precision operation as the gasgrd cube writer (0.5f*chi is exact).
+        for (std::size_t i = 0; i < result.size(); ++i) result[i] = result[i]-0.5f*chi[i];
+    }
+    return result;
+}
+std::vector<float> Reader::read_file_region(int field, int slot, const std::int64_t origin[3], const int extent[3]) const {
     std::vector<float> result(volume(extent));
-    if (impl_->field != field || impl_->slot != slot) {
-        impl_->reset();
-        impl_->file = H5Fopen(filename(field, slot).c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-        require(impl_->file >= 0, "Cannot open HDF5 input");
-        impl_->data = H5Dopen2(impl_->file, "/data", H5P_DEFAULT);
-        require(impl_->data >= 0, "Cannot open HDF5 /data");
-        impl_->space = H5Dget_space(impl_->data);
-        require(impl_->space >= 0, "Cannot inspect HDF5 /data");
-        H5Handle type(H5Dget_type(impl_->data), H5Tclose);
-        impl_->source_bytes = H5Tget_size(type.id);
-        impl_->field = field; impl_->slot = slot;
+    auto& h = impl_->handles[field == CHI_FILE ? 1 : 0];
+    if (h.field != field || h.slot != slot) {
+        h.reset();
+        h.file = H5Fopen(filename(field, slot).c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+        require(h.file >= 0, "Cannot open HDF5 input");
+        h.data = H5Dopen2(h.file, "/data", H5P_DEFAULT);
+        require(h.data >= 0, "Cannot open HDF5 /data");
+        h.space = H5Dget_space(h.data);
+        require(h.space >= 0, "Cannot inspect HDF5 /data");
+        H5Handle type(H5Dget_type(h.data), H5Tclose);
+        h.source_bytes = H5Tget_size(type.id);
+        h.field = field; h.slot = slot;
     }
     const hsize_t memory_shape[3] = {static_cast<hsize_t>(extent[2]), static_cast<hsize_t>(extent[1]), static_cast<hsize_t>(extent[0])};
     H5Handle memory_space(H5Screate_simple(3, memory_shape, nullptr), H5Sclose);
@@ -251,13 +304,13 @@ std::vector<float> Reader::read_region(int field, int slot, const std::int64_t o
         const hsize_t start[3] = {z.file, y.file, x.file};
         const hsize_t output[3] = {z.memory, y.memory, x.memory};
         const hsize_t count[3] = {z.length, y.length, x.length};
-        require(H5Sselect_hyperslab(impl_->space, H5S_SELECT_SET, start, nullptr, count, nullptr) >= 0 &&
+        require(H5Sselect_hyperslab(h.space, H5S_SELECT_SET, start, nullptr, count, nullptr) >= 0 &&
                 H5Sselect_hyperslab(memory_space.id, H5S_SELECT_SET, output, nullptr, count, nullptr) >= 0,
                 "Cannot select HDF5 subarray");
-        require(H5Dread(impl_->data, H5T_NATIVE_FLOAT, memory_space.id, impl_->space, H5P_DEFAULT, result.data()) >= 0,
+        require(H5Dread(h.data, H5T_NATIVE_FLOAT, memory_space.id, h.space, H5P_DEFAULT, result.data()) >= 0,
                 "Cannot read HDF5 subarray");
     }
-    const auto bytes = checked_multiply(result.size(), impl_->source_bytes);
+    const auto bytes = checked_multiply(result.size(), h.source_bytes);
     impl_->bytes = checked_add(impl_->bytes, bytes);
     return result;
 }

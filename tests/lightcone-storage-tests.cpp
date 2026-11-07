@@ -121,8 +121,10 @@ void addressing_tests() {
 }
 void interpolation_tests() {
     TempDirectory temp;
+    for (auto mode : {GeometryConvention::Legacy, GeometryConvention::GasgrdV1})
     for (bool staggered : {false,true}) {
         Fixture f(32,3,staggered);
+        f.geometry.convention = mode;
         f.fill([](int field,double tau,double x,double y,double z) { return static_cast<float>((field+1)*1e-6*(tau+1)*(x*x+2*y*y+z*z)); });
         const auto base = (temp.path/(staggered ? "staggered" : "collocated")).string(); f.write(base);
         Reader reader(base,3);

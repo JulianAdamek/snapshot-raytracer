@@ -41,7 +41,9 @@ public:
     DeviceBuffer(DeviceBuffer&& other) noexcept : data(other.data) { other.data = nullptr; }
 };
 struct Options {
-    std::string base, info;
+    std::string base, info, geometry_file;
+    lcg::GeometryInfo writer;
+    lightcone::ScalarSource scalar = lightcone::ScalarSource::Phi;
     std::int64_t nside = 0;
     int thickness = 0, batch = -1;
     double observer_tau = NAN, target_z = NAN;
@@ -53,12 +55,16 @@ struct Options {
     lightcone::TimeDerivativeMode time_derivatives = lightcone::TimeDerivativeMode::FiniteDifference;
 };
 const char* usage =
-    "Usage: lightcone-raytracer <lightcone-base> <Nside> --info <info.bin> --thickness <T>\n"
-    "  --vertex <x/L> <y/L> <z/L> --observer-tau <tau/L> --target-z <z> [--batch <0..11>]\n"
+    "Usage: lightcone-raytracer <lightcone-base> <Nside> --info <info.bin> --target-z <z>\n"
+    "  (--geometry <lccube_geometry.bin> | --thickness <T> --vertex <x/L> <y/L> <z/L> --observer-tau <tau/L>)\n"
+    "  [--batch <0..11>]\n"
     "  [--b-layout staggered|collocated] [--direction <dx> <dy> <dz> --opening-deg <angle>]\n"
     "  [--radial-range <rmin/L> <rmax/L>] [--ordering nested|ring]\n"
     "  [--storage full|ziggurat] [--slab-cells <N>] [--padding-cells <N>]\n"
-    "  [--max-lookback-cells <S>] [--time-derivatives finite-difference|zero]\n";
+    "  [--max-lookback-cells <S>] [--time-derivatives finite-difference|zero]\n"
+    "  [--scalar phi|weyl|phi-chi]\n"
+    "With --geometry, vertex, direction, opening, radial range, thickness, B layout and\n"
+    "the default observer time come from the binary file. Otherwise legacy geometry is used.\n";
 Options parse(int argc, char** argv) {
     if (argc < 3) throw std::runtime_error(usage);
     Options o;
@@ -77,6 +83,7 @@ Options parse(int argc, char** argv) {
     };
     o.nside = integer(argv[2]);
     bool vertex = false, direction = false, opening = false, slab_option = false;
+    bool radial = false, layout_set = false, observer_set = false, scalar_set = false;
     double opening_deg = 180;
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -91,7 +98,16 @@ Options parse(int argc, char** argv) {
             o.thickness = static_cast<int>(value);
         }
         else if (arg == "--vertex") { for (double& x : o.geometry.vertex) x = number(next()); vertex = true; }
-        else if (arg == "--observer-tau") o.observer_tau = number(next());
+        else if (arg == "--observer-tau") { o.observer_tau = number(next()); observer_set = true; }
+        else if (arg == "--geometry") o.geometry_file = next();
+        else if (arg == "--scalar") {
+            const auto source = next();
+            if (source == "phi") o.scalar = lightcone::ScalarSource::Phi;
+            else if (source == "weyl") o.scalar = lightcone::ScalarSource::Weyl;
+            else if (source == "phi-chi") o.scalar = lightcone::ScalarSource::PhiChi;
+            else throw std::runtime_error("Scalar source must be phi, weyl or phi-chi");
+            scalar_set = true;
+        }
         else if (arg == "--target-z") o.target_z = number(next());
         else if (arg == "--time-derivatives") {
             const auto mode = next();
@@ -130,14 +146,45 @@ Options parse(int argc, char** argv) {
             const auto layout = next();
             if (layout != "staggered" && layout != "collocated") throw std::runtime_error("Unknown B layout: " + layout);
             o.staggered = layout == "staggered";
+            layout_set = true;
         }
         else if (arg == "--direction") { for (double& x : o.geometry.direction) x = number(next()); direction = true; }
         else if (arg == "--opening-deg") { opening_deg = number(next()); opening = true; }
         else if (arg == "--radial-range") {
-            o.geometry.inner = number(next()); o.geometry.outer = number(next()); o.geometry.radial_limit = true;
+            o.geometry.inner = number(next()); o.geometry.outer = number(next()); o.geometry.radial_limit = true; radial = true;
             if (o.geometry.inner < 0 || o.geometry.outer <= o.geometry.inner) throw std::runtime_error("Require 0 <= rmin < rmax");
         }
         else throw std::runtime_error("Unknown option: " + arg);
+    }
+    if (!o.geometry_file.empty()) {
+        const auto& g = o.writer = lightcone::read_geometry_info(o.geometry_file);
+        if (vertex || direction || opening || radial)
+            throw std::runtime_error("--vertex, --direction, --opening-deg and --radial-range are taken from the geometry file");
+        if (o.thickness && o.thickness != g.thickness) throw std::runtime_error("--thickness conflicts with the geometry file");
+        if (layout_set && o.staggered != (g.b_collocated == 0)) throw std::runtime_error("--b-layout conflicts with the geometry file");
+        if (!scalar_set)
+            o.scalar = g.fields & lcg::FIELD_WEYL ? lightcone::ScalarSource::Weyl : lightcone::ScalarSource::PhiChi;
+        if (o.scalar == lightcone::ScalarSource::Phi)
+            throw std::runtime_error("gasgrd geometry describes raw phi; select --scalar weyl or --scalar phi-chi");
+        if (o.scalar == lightcone::ScalarSource::Weyl && !(g.fields & lcg::FIELD_WEYL)) throw std::runtime_error("The light cone has no weyl output");
+        if (o.scalar == lightcone::ScalarSource::PhiChi && (g.fields & (lcg::FIELD_PHI|lcg::FIELD_CHI)) != (lcg::FIELD_PHI|lcg::FIELD_CHI))
+            throw std::runtime_error("The light cone lacks phi or chi output");
+        if (!(g.fields & lcg::FIELD_B)) throw std::runtime_error("The light cone has no B output");
+        o.thickness = g.thickness;
+        o.staggered = g.b_collocated == 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            o.geometry.vertex[axis] = g.vertex[axis]; o.geometry.direction[axis] = g.direction[axis];
+        }
+        o.geometry.opening_cos = g.opening_cos;
+        o.geometry.angular_limit = g.opening_cos > -1.0;
+        o.geometry.inner = g.distance_inner; o.geometry.outer = g.distance_outer; o.geometry.radial_limit = true;
+        o.geometry.convention = lightcone::GeometryConvention::GasgrdV1;
+        if (!observer_set) o.observer_tau = g.tauobs;
+        else if (o.observer_tau != g.tauobs)
+            std::cerr << "Warning: --observer-tau differs from the writer's tauobs " << std::setprecision(17) << g.tauobs << '\n';
+        if (g.periodic_overlap || g.distance_outer > 0.5)
+            std::cerr << "Warning: the footprint may overlap periodic copies; overwritten data cannot be recovered. Continuing.\n";
+        vertex = true;
     }
     if (!lightcone::valid_nside(o.nside)) throw std::runtime_error("Nside must be a power of two in 1..2^29");
     if (o.ziggurat && o.batch < 0) throw std::runtime_error("Ziggurat storage requires --batch");
@@ -149,7 +196,8 @@ Options parse(int argc, char** argv) {
     if (opening != direction) throw std::runtime_error("Supply --direction and --opening-deg together");
     if (opening_deg <= 0 || opening_deg > 180) throw std::runtime_error("Opening angle must be in (0,180]");
     if (direction) {
-        const double norm = std::hypot(o.geometry.direction[0], o.geometry.direction[1], o.geometry.direction[2]);
+        const auto& d = o.geometry.direction;
+        const double norm = lcg::sqrt(lcg::add(lcg::add(lcg::mul(d[0],d[0]),lcg::mul(d[1],d[1])),lcg::mul(d[2],d[2])));
         if (!std::isfinite(norm) || norm == 0.0) throw std::runtime_error("Direction must be a finite nonzero vector");
         for (double& x : o.geometry.direction) x /= norm;
         o.geometry.angular_limit = opening_deg < 180;
@@ -185,13 +233,19 @@ using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now()-start).count(); }
 
 int run(const Options& o) {
+    std::cout << "Shell geometry: " << lightcone::geometry_convention_name(o.geometry.convention) << '\n';
+    if (o.geometry_file.empty())
+        std::cerr << "Warning: no geometry sidecar supplied; using the legacy writer's wrapped-position/shifted-vertex convention "
+                     "with separately rounded products and sums. Geometry parameters and original compiler arithmetic cannot be fully verified. "
+                     "Supply the original geometry at full precision.\n";
     const auto metadata = lightcone::build_metadata(lightcone::read_info(o.info, o.thickness), o.thickness, o.geometry);
     auto view = lightcone::host_view(metadata, 1, o.geometry, nullptr);
     double a_obs;
     if (lightcone::background_at(view, o.observer_tau, a_obs) != lightcone::Status::Ok)
         throw std::runtime_error("Observation time is outside the sidecar background table; extrapolation is disabled");
-    lightcone::Reader reader(o.base, o.thickness);
+    lightcone::Reader reader(o.base, o.thickness, o.scalar);
     const int n = reader.grid_size();
+    if (!o.geometry_file.empty()) lightcone::require_geometry_grid(o.writer, n);
     const int extent[3] = {n, n, n};
     const std::size_t full_voxels = lightcone::checked_volume(extent);
     const double lookback = std::min((o.observer_tau-metadata.times.front())*n, o.max_lookback);
@@ -200,7 +254,8 @@ int run(const Options& o) {
     std::cout << "Grid: " << n << "^3; thickness: " << o.thickness << "; records: " << metadata.records.size()
               << "; tau range: " << metadata.times.front() << " .. " << metadata.times.back()
               << "; a_obs: " << a_obs << "; effective look-back cells: " << effective_lookback << '\n';
-    std::cout << "Time derivatives: " << lightcone::time_derivative_name(o.time_derivatives) << '\n';
+    std::cout << "Time derivatives: " << lightcone::time_derivative_name(o.time_derivatives)
+              << "; scalar source: " << lightcone::scalar_source_name(o.scalar) << '\n';
     if (!o.geometry.angular_limit || !o.geometry.radial_limit)
         std::cerr << "Warning: undeclared footprint limits are assumed covered; unrecorded holes cannot be detected.\n";
     double max_radius = 0;
@@ -229,7 +284,9 @@ int run(const Options& o) {
     auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(4ULL*o.thickness, sizeof(lightcone::GridView)));
     auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(layout.slabs.size(), sizeof(lightcone::SlabDescriptor)));
     auxiliary = lightcone::checked_add(auxiliary, sizeof(int)+sizeof(lightcone::MissDiagnostic));
-    const auto estimate = lightcone::estimate_storage(voxels, largest, o.thickness, count, auxiliary);
+    auto estimate = lightcone::estimate_storage(voxels, largest, o.thickness, count, auxiliary);
+    if (o.scalar == lightcone::ScalarSource::PhiChi)
+        estimate.field_staging_bytes = lightcone::checked_multiply(largest, 2*sizeof(float));
     std::size_t free_bytes, total_bytes;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
     lightcone::require_storage_memory(estimate, free_bytes);
@@ -306,6 +363,8 @@ int run(const Options& o) {
     metrics << std::setprecision(17) << "{\"storage\":\"" << (o.ziggurat ? "ziggurat" : "full")
             << "\",\"static_shear_transport\":\"negative"
             << "\",\"time_derivatives\":\"" << lightcone::time_derivative_name(o.time_derivatives)
+            << "\",\"shell_geometry\":\"" << lightcone::geometry_convention_name(o.geometry.convention)
+            << "\",\"scalar_source\":\"" << lightcone::scalar_source_name(o.scalar)
             << "\",\"ordering\":\"" << (o.ordering == lightcone::Ordering::Nested ? "NESTED" : "RING")
             << "\",\"full_voxels\":" << full_voxels << ",\"resident_voxels\":" << voxels
             << ",\"slabs\":" << layout.slabs.size() << ",\"field_bytes\":" << estimate.field_bytes

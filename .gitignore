@@ -5,6 +5,8 @@
 /tests/lightcone-reference-tests
 /tests/lightcone-storage-tests
 /tests/lightcone-time-tests
+/tests/lightcone-geometry-tests
+/tests/lightcone-geometry-gpu
 /tests/snapshot-reference.o
 /validation/validation-tools
 

@@ -29,6 +29,9 @@ endif
 
 all: $(TARGET)
 
+LC_GEOMETRY_HEADERS = lccube_geometry.h lightcone_geometry.hpp
+lightcone-raytracer tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-reference-tests validation/validation-tools: $(LC_GEOMETRY_HEADERS)
+
 $(TARGET): $(SRC)
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ $< $(HDF5_LIBS) -lchealpix $(LIBS)
 
@@ -53,8 +56,18 @@ tests/lightcone-storage-tests: tests/lightcone-storage-tests.cpp tests/test_supp
 tests/lightcone-time-tests: tests/lightcone-time-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
 	$(CXX) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-time-tests.cpp lightcone.cpp lightcone_layout.cpp $(HDF5_LIBS) $(LIBS)
 
-test-cpu: tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests
+tests/lightcone-geometry-tests: tests/lightcone-geometry-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp $(LC_GEOMETRY_HEADERS)
+	$(CXX) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-geometry-tests.cpp lightcone.cpp lightcone_layout.cpp $(HDF5_LIBS) $(LIBS)
+
+tests/lightcone-geometry-gpu: tests/lightcone-geometry-gpu.cu lightcone.hpp lightcone_sampling.hpp $(LC_GEOMETRY_HEADERS)
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(INCLUDES) -I. -o $@ $<
+
+test-gpu: tests/lightcone-geometry-gpu
+	./tests/lightcone-geometry-gpu
+
+test-cpu: tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-geometry-tests
 	./tests/lightcone-tests
+	./tests/lightcone-geometry-tests
 	OMP_NUM_THREADS=4 ./tests/lightcone-storage-tests
 	./tests/lightcone-time-tests
 
@@ -67,6 +80,6 @@ test-validation: lightcone-raytracer validation/validation-tools
 test: test-cpu test-reference test-validation
 
 clean:
-	rm -f $(TARGET) lightcone-raytracer tests/lightcone-tests tests/lightcone-reference-tests tests/snapshot-reference.o tests/lightcone-storage-tests tests/lightcone-time-tests validation/validation-tools
+	rm -f $(TARGET) lightcone-raytracer tests/lightcone-tests tests/lightcone-reference-tests tests/snapshot-reference.o tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-geometry-tests tests/lightcone-geometry-gpu validation/validation-tools
 
-.PHONY: all clean test test-cpu test-reference test-validation
+.PHONY: all clean test test-cpu test-gpu test-reference test-validation

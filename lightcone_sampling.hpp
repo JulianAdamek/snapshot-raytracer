@@ -1,5 +1,6 @@
 #pragma once
 #include "lightcone.hpp"
+#include "lightcone_geometry.hpp"
 #include <cmath>
 #include <cfloat>
 
@@ -90,19 +91,10 @@ LC_HD inline Status node_at(const View& view, int field, const std::int64_t xyz[
     if (partial_time) *partial_time = 0;
     const bool derivative = partial_time && view.time_derivatives == TimeDerivativeMode::FiniteDifference;
     if (derivative && view.thickness < 2) return Status::TimeCoverage;
-    const auto& geometry = view.geometry;
-    const auto& first_grid = view.grids[field*view.thickness];
-    double displacement[3];
-    double r2 = 0.0, dot = 0.0;
-    for (int axis = 0; axis < 3; ++axis) {
-        displacement[axis] = (static_cast<double>(xyz[axis])+first_grid.node_offset[axis])/view.n-geometry.vertex[axis];
-        r2 += displacement[axis]*displacement[axis];
-        dot += displacement[axis]*geometry.direction[axis];
-    }
-    const double radius = std::sqrt(r2);
-    if (!finite(radius)) return Status::InvalidValue;
-    if (geometry.angular_limit && (radius == 0.0 || dot/radius <= geometry.opening_cos))
-        return Status::SpatialCoverage;
+    bool cone;
+    const double radius = node_radius(view, view.grids[field*view.thickness], xyz, cone);
+    if (radius < 0.0) return Status::InvalidValue;
+    if (!cone) return Status::SpatialCoverage;
     int below = -1, above = -1, exact = -1;
     double low_tau = -DBL_MAX, high_tau = DBL_MAX;
     bool any = false;

@@ -221,12 +221,12 @@ def main():
                 'slab_cells': args.slab_cells, 'padding_cells': args.padding_cells, 'max_lookback_cells': args.max_lookback_cells,
                 'time_derivative_modes': ['finite-difference','zero'] if args.validate_isw else ['finite-difference'],
                 'frozen_baseline': str(baseline) if baseline else None,
-                'static_shear_transport': 'negative',
+                'static_shear_transport': 'negative', 'shell_geometry': 'legacy',
                 'background_model': 'flat matter + Lambda; radiation excluded identically from both tracers',
                 'input_settings': str(Path(settings).resolve()),
                 'inputs': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in (potential, vector)],
                 'source_sha256': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                                  for p in list(root.glob('*.cu'))+list(root.glob('lightcone*.*')) if p.is_file()},
+                                  for p in list(root.glob('*.cu'))+list(root.glob('lightcone*.*'))+[root/'lccube_geometry.h'] if p.is_file()},
                 'slurm_job_id': os.environ.get('SLURM_JOB_ID'), 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
     write_json(run/'manifest.json', manifest)
     run_logged([tool, 'prepare', potential, vector, run/'fixture', config['ngrid']], root, run/'prepare.log')
@@ -259,6 +259,8 @@ def main():
         tracer = json.loads((directory/'run-metrics.json').read_text())
         if tracer.get('static_shear_transport') != 'negative':
             raise RuntimeError(f'Tracer binary lacks the static shear-sign correction in {directory}')
+        if tracer.get('shell_geometry') != 'legacy':
+            raise RuntimeError(f'Incorrect shell geometry mode in {directory}')
         if tracer['time_derivatives'] != mode:
             raise RuntimeError(f'Incorrect derivative mode in {directory}')
         if tracer['residency_misses']:

@@ -80,6 +80,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('power of two',result.stderr)
 
+    def test_geometry_cli(self):
+        executable = str(ROOT/'lightcone-raytracer')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'geometry.bin'
+            def geometry(convention=1, overlap=1, fields=4|16):
+                # Native byte order, packed fields; compatible with gasgrd convention 1.
+                path.write_bytes(struct.pack('=8si8i11d', b'LCCUBEGM', 8,
+                    convention, 576, 3, 0, 1, fields, overlap, 0,
+                    0.1, 0.2, 0.3, 0.6, 0.0, 0.8, -1.0, 0.8, 0.0, 1.0, 4032.0))
+            geometry()
+            base = [executable, 'lc', '16', '--info', str(Path(directory)/'missing-info'),
+                    '--geometry', str(path), '--target-z', '0.1']
+            result = subprocess.run(base, capture_output=True, text=True)
+            self.assertIn('Shell geometry: gasgrd-v1', result.stdout)
+            self.assertIn('Cannot open info file', result.stderr)  # Passed CLI; no GPU calls.
+            self.assertIn('Continuing', result.stderr)  # Overlap is tolerated.
+            self.assertNotIn('no geometry sidecar', result.stderr)
+            for extra, message in [(['--vertex','0','0','0'], 'taken from the geometry file'),
+                    (['--direction','0','0','1','--opening-deg','60'], 'taken from the geometry file'),
+                    (['--radial-range','0','0.5'], 'taken from the geometry file'),
+                    (['--thickness','2'], 'thickness conflicts'),
+                    (['--b-layout','collocated'], 'b-layout conflicts'),
+                    (['--scalar','phi'], 'raw phi'),
+                    (['--scalar','phi-chi'], 'lacks phi or chi')]:
+                with self.subTest(extra=extra):
+                    result = subprocess.run(base+extra, capture_output=True, text=True)
+                    self.assertIn(message, result.stderr)
+            geometry(fields=1|2|4)
+            result = subprocess.run(base, capture_output=True, text=True)
+            self.assertIn('Cannot open info file', result.stderr)  # phi-chi inferred.
+            geometry(convention=99)
+            result = subprocess.run(base, capture_output=True, text=True)
+            self.assertIn('not supported', result.stderr)
+            path.unlink()
+            result = subprocess.run(base, capture_output=True, text=True)
+            self.assertIn('Cannot open light cone geometry file', result.stderr)
+            self.assertNotIn('using the legacy writer', result.stderr)
+            legacy = base[:]; del legacy[legacy.index('--geometry'):legacy.index('--geometry')+2]
+            legacy += ['--vertex','0.5','0.5','0.5','--observer-tau','1','--thickness','3']
+            result = subprocess.run(legacy, capture_output=True, text=True)
+            self.assertIn('Shell geometry: legacy', result.stdout)
+            self.assertIn('cannot be fully verified', result.stderr)
+            self.assertIn('Cannot open info file', result.stderr)
+
     def test_twelve_face_assembly(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([str(TOOL),'assembly-self-test',str(Path(directory)/'good')],
@@ -124,7 +168,7 @@ class WorkflowTests(unittest.TestCase):
                     ordering = options[options.index('--ordering')+1].upper()
                     orderings[str(cwd)] = ordering
                     run_static.write_json(Path(cwd)/'run-metrics.json', {'storage':storage,'residency_misses':0,'time_derivatives':options[options.index('--time-derivatives')+1],
-                        'static_shear_transport':'negative'})
+                        'static_shear_transport':'negative', 'shell_geometry':'legacy'})
                 return {'wall_seconds':0,'max_host_rss_kib':0}
 
             def compare(command, cwd):

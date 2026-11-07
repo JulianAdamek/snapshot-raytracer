@@ -26,6 +26,8 @@ srun --ntasks=1 --gpus-per-task=1 bash -c '
     printf "CUDA_VISIBLE_DEVICES=%s\n" "${CUDA_VISIBLE_DEVICES:-unset}"
     ./tests/lightcone-time-tests
     ./tests/lightcone-tests
+    ./tests/lightcone-geometry-tests
+    ./tests/lightcone-geometry-gpu
     ./tests/lightcone-storage-tests
     ./tests/lightcone-reference-tests
     python3 validation/test_workflow.py

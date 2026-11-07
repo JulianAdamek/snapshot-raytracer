@@ -1,5 +1,17 @@
 # GPU validation on Alps
 
+The CPU suite now includes independent legacy-writer and gasgrd-v1 shell replay,
+exact-boundary and adjacent-double cases, periodic crossings, all B offsets,
+binary geometry validation and both storage paths. `tests/lightcone-geometry-gpu`
+checks bitwise host/device radii, cone decisions and boundary ownership for both
+conventions. All three Slurm scripts run these geometry tests before the existing
+frozen-map comparisons; `make test` itself remains CPU-only.
+
+Frozen fixtures use the legacy mode (no geometry sidecar); the manifest and run
+metrics record this choice and hash the vendored geometry header. These tests do
+not verify the end-to-end gasgrd simulation writer: a future simulation fixture
+must also check its recorded cycles against reconstructed times.
+
 Sources and GH200 binaries are prepared at:
 
 ```text

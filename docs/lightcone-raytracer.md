@@ -51,6 +51,11 @@ B components must already have the legacy writer's normalization. They are
 staggered by default; choose `--b-layout collocated` for `LIGHTCONE_INTERPOLATE`
 outputs. The sidecar cannot identify that build option.
 
+`--scalar phi` (the legacy default) means the `_phi` files already contain W.
+`--scalar weyl` reads `_weyl` files instead; `--scalar phi-chi` reads raw `_phi`
+and `_chi` files and forms `W = phi - 0.5f*chi` per region, before time sampling.
+For single-precision gasgrd output this matches its stored Weyl field exactly.
+
 The native-endian binary info file has no header. Each packed record is an int32
 cycle followed by float64 `tau/L`, scale factor, particle inner/outer radii, and
 `T+1` metric shell boundaries (radii in box units): `4 + 8*(T+5)` bytes.
@@ -68,6 +73,51 @@ Thickness 1 uses filenames `lc_phi.h5`, `lc_B1.h5`, etc., and requires explicit
 `--time-derivatives zero`. This mode suppresses time-derivative terms and ISW
 while retaining the available field-value sampling. Default finite differences
 require at least two recorded time samples at every required stencil node.
+
+## Shell geometry conventions
+
+For new gasgrd cubes, supply the writer's additional binary geometry sidecar:
+
+```bash
+./lightcone-raytracer lc 16 --info lc_lccube_info.bin \
+  --geometry lc_lccube_geometry.bin --target-z 0.15
+```
+
+This selects **gasgrd convention 1**. The exact vertex, direction, opening cosine,
+radial limits, thickness, B layout and default observation time come from that
+file. Vertex/direction/opening/radial CLI overrides are rejected; repeated
+thickness/B-layout options must agree. An explicit `--observer-tau` may override
+the recorded observation time, with a warning if it differs. HDF5 grid dimensions
+must match the recorded grid size. Unsupported convention versions, corrupt files
+and explicitly supplied missing files are errors; they never silently select
+legacy arithmetic.
+
+The scalar source defaults to `_weyl` if declared by the geometry, otherwise to
+`phi-chi`. Gasgrd's raw `_phi` alone is not a Weyl input. These checks prevent
+using raw phi inadvertently when importing geometry.
+
+The vendored [lccube_geometry.h](../lccube_geometry.h) is copied unchanged from
+gasgrd_dev commit `725898c`. Its convention-1 routine is also called by that
+writer: integer unwrapped node coordinates, explicitly rounded division and
+subtraction, then a specified fused multiply-add sequence. CPU and CUDA sampling
+use the same convention; no gasgrd checkout is required to build this tracer.
+
+Without `--geometry`, the tracer selects **legacy gevolution arithmetic** and
+warns once that numerical consistency cannot be fully verified. For each node it
+constructs the wrapped grid position and corresponding shifted vertex, matching
+the old writer. Squared-radius and angular dot-product expressions use separately
+rounded products and left-associated sums, with fusion disabled for those
+operations. The physical periodic image is preserved; this is not a minimum-image
+radius. B staggering is included in both modes.
+
+Supply the original normalized geometry with full round-trip precision (17
+significant decimal digits, or hexadecimal floats). Exact binary vertices such
+as 0 and 0.5 avoid coordinate-rounding ambiguity, but legacy simulation builds
+may have used a different contraction policy. The fallback therefore offers
+compatibility with unfused legacy arithmetic, not a universal bitwise guarantee.
+It neither adds an epsilon to shell boundaries nor discards samples near them.
+Both modes retain half-open `[inner, outer)` shells and warn about possible
+periodic overlap without rejecting the footprint. Overwritten data remain lost.
 
 ## Face batches and memory
 
@@ -131,14 +181,16 @@ ISW has the positive source-to-observer temperature convention and excludes
 endpoint gravitational-redshift and Doppler terms. Frozen fields give exactly
 zero ISW. Failed rays have NaN optical/ISW outputs and retain the last available
 redshift in `zmap`. `run-metrics.json` records storage sizes, requested source
-bytes, timings, derivative mode and residency misses.
+bytes, timings, derivative mode, scalar source, shell geometry convention and
+residency misses.
 
 `make test` runs the CPU suites, including analytic shear transport tests and
 comparisons against the snapshot source; CUDA compilation is needed but these
-tests launch no GPU kernels. Frozen-field GH200 checks passed before the static
-shear-sign correction. Both tracers now include that correction, whose GPU
-regression is pending inspection. Historical maps from the previous sign are
-not unchanged-output references. Genuinely evolving simulation light cones still
+tests launch no GPU kernels. `make test-gpu` separately verifies host/device
+radius bits, angular decisions and shell ownership for both geometry modes.
+Frozen-field GH200 job 5277317 passed after the static shear-sign correction;
+GPU validation of the geometry changes remains pending. Historical maps from
+the previous sign are not unchanged-output references. Genuinely evolving simulation light cones still
 need validation. See [the validation guide](../validation/README.md) for the Alps
 job and [the reference notes](../README.md#static-shear-transport-correction)
 for the shear correction and conventions.

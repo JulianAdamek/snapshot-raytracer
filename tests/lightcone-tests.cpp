@@ -114,6 +114,36 @@ void storage_tests() {
                 check((std::isnan(actual) && std::isnan(expected)) || actual == expected, "Periodic XYZ hyperslab, including float64 conversion");
             }
         }
+        // Scalar sources: _weyl files, or W = phi - chi/2 from _phi and _chi files.
+        rejects([&] { Reader no_chi(base, t, ScalarSource::PhiChi); }, "Reject phi-chi without chi files");
+        rejects([&] { Reader no_weyl(base, t, ScalarSource::Weyl); }, "Reject weyl without weyl files");
+        std::vector<std::vector<float>> chi(t), weyl(t);
+        for (int slot = 0; slot < t; ++slot) {
+            chi[slot].resize(512); weyl[slot].resize(512);
+            for (int i = 0; i < 512; ++i) {
+                const float phi = f.fields[slot][i];
+                chi[slot][i] = std::isnan(phi) ? NAN : 0.37f*phi-3.1f+0.001f*i;
+                weyl[slot][i] = phi-0.5f*chi[slot][i];
+            }
+            const std::string suffix = t == 1 ? "" : "_"+std::to_string(slot);
+            write_grid(base+"_chi"+suffix+".h5", 8, chi[slot], slot%2 == 1); // float64 chi exercises conversion
+            write_grid(base+"_weyl"+suffix+".h5", 8, weyl[slot]);
+        }
+        Reader combined(base, t, ScalarSource::PhiChi), stored(base, t, ScalarSource::Weyl);
+        check(combined.filename(0, 0) == reader.filename(0, 0) && combined.filename(CHI_FILE, 0).find("_chi") != std::string::npos &&
+              stored.filename(0, 0).find("_weyl") != std::string::npos, "Scalar source file names");
+        rejects([&] { reader.filename(CHI_FILE, 0); }, "No chi file without phi-chi");
+        for (int slot = 0; slot < t; ++slot) {
+            const auto from_phi_chi = combined.read_region(0, slot, origin, extent);
+            const auto from_weyl = stored.read_region(0, slot, origin, extent);
+            const auto b = combined.read_region(1, slot, origin, extent);
+            const auto b_reference = reader.read_region(1, slot, origin, extent);
+            for (std::size_t i = 0; i < from_phi_chi.size(); ++i) {
+                const float a = from_phi_chi[i], w = from_weyl[i];
+                check((std::isnan(a) && std::isnan(w)) || a == w, "phi - chi/2 matches stored weyl bit for bit");
+                check((std::isnan(b[i]) && std::isnan(b_reference[i])) || b[i] == b_reference[i], "B unaffected by scalar source");
+            }
+        }
         std::filesystem::remove(reader.filename(3, t-1));
         rejects([&] { Reader missing(base, t); }, "Reject missing component");
         write_grid(reader.filename(3, t-1), 7, std::vector<float>(343));
