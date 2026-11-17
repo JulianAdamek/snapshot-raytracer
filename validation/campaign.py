@@ -66,7 +66,8 @@ def init(args):
         shutil.copy2(path,root/'bin'/name);binaries[name]=old.sha256(root/'bin'/name)
     shutil.copy2(ROOT/'validation/bin/build.json',root/'build.json')
     (root/'tables').mkdir()
-    config={'schema':1,'created_utc':stamp(),'original':str(original),'manifest_sha256':old.sha256(original/'manifest.json'),
+    config={'schema':1,'created_utc':stamp(),'original':str(original),
+            'workflow_revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'manifest_sha256':old.sha256(original/'manifest.json'),
             'level':args.level,'io_mode':'auto','io_buffer_mib':256,'binary_sha256':binaries,
             'python_sha256':{name:old.sha256(ROOT/'validation'/name) for name in ('campaign.py','ode_comparison.py','run_static.py')},
             'probe_nside':1024,'final_ordering':'NESTED'}
@@ -98,17 +99,29 @@ def task_key(t):
     return f"{t['variant']}/nside-{t['nside']}/face-{t['face']:02d}/level-{t['level']}-part-{t['part']}"
 
 
+def check_part_metadata(info, task, manifest):
+    expected={key:task[key] for key in ('nside','first','count','face','level','part','run_id')}
+    expected['physics']=manifest['variants'][task['variant']]
+    expected['pass']=True
+    if any(info.get(key)!=value for key,value in expected.items()):
+        raise RuntimeError('Compact header does not match its completion/task')
+
+
 def verified(record, manifest, deep=False, tool=None):
     if not record.get('pass'): raise RuntimeError('Invalid completion marker')
     t=record['task']; expected=interval(manifest,t['variant'],t['nside'],t['face'],t['level'],t['part'])
     if any(t.get(k)!=v for k,v in expected.items()): raise RuntimeError('Completion scientific configuration mismatch')
+    part_path=str(Path(record['part_file']).resolve(strict=True))
+    if not any(item['identity']['path']==part_path for item in record['artifacts']):
+        raise RuntimeError('Compact file is not bound to a recorded checksum')
     for artifact in record['artifacts']:
         path=Path(artifact['path'])
         if old.identity(path)!=artifact['identity']: raise RuntimeError('Completed artifact changed: '+str(path))
         if deep and old.sha256(path)!=artifact['sha256']: raise RuntimeError('Completed artifact checksum mismatch: '+str(path))
     if deep:
         old.require_slurm()
-        subprocess.run([str(tool),'check-part',record['part_file']],check=True,stdout=subprocess.DEVNULL)
+        result=subprocess.run([str(tool),'check-part',record['part_file']],check=True,capture_output=True,text=True)
+        check_part_metadata(json.loads(result.stdout),t,manifest)
     return record
 
 
@@ -262,6 +275,8 @@ def check_metrics(metrics,manifest,t):
               'first_pixel':t['first'],'pixel_count':t['count'],'subdivision_level':t['level'],'part':t['part'],
               'run_id':t['run_id'],'stage':'complete','output_format':'compact-hdf5','residency_misses':0,
               'io_mode_requested':t.get('io_mode','auto')}
+    mode=t.get('io_mode','auto')
+    expected['io_mode']='tiles' if mode=='tiles' or (mode=='auto' and t['face'] in (4,6)) else 'regions'
     if any(metrics.get(k)!=v for k,v in expected.items()): raise RuntimeError('Wrong region configuration or incomplete run')
     counts=metrics['ray_status_counts']
     if counts.get('success')!=t['count'] or sum(counts.values())!=t['count']: raise RuntimeError('Region has failed rays')
@@ -277,8 +292,12 @@ def run(args):
     table=read(args.table)
     if old.sha256(args.table)!=read(args.table.with_suffix('.sha256'))['sha256']: raise RuntimeError('Task table changed')
     if table['campaign_sha256']!=old.sha256(root/'campaign.json'): raise RuntimeError('Wrong campaign task table')
-    phase=table['phase'];prerequisites(root,config,manifest,phase)
-    rank=int(os.environ.get('SLURM_PROCID','0'));group=int(os.environ.get('SLURM_ARRAY_TASK_ID','0'));index=4*group+rank
+    phase=table['phase']
+    if phase not in PHASES: raise RuntimeError('Unknown task-table phase')
+    prerequisites(root,config,manifest,phase)
+    rank=int(os.environ.get('SLURM_PROCID','0'));group=int(os.environ.get('SLURM_ARRAY_TASK_ID','0'))
+    if not 0<=rank<4 or group<0: raise RuntimeError('Expected rank 0..3 and nonnegative array index')
+    index=4*group+rank
     if index>=len(table['tasks']): print('No task for this rank');return
     t=table['tasks'][index];expected=interval(manifest,t['variant'],t['nside'],t['face'],t['level'],t['part'])
     if any(t.get(k)!=v for k,v in expected.items()): raise RuntimeError('Invalid task table science')
@@ -296,6 +315,7 @@ def run(args):
         metrics=read(attempt/'run-metrics.json');check_metrics(metrics,manifest,t)
         checking=time.monotonic();part=attempt/'ray-part.h5'
         run_logged([root/'bin/validation-tools','check-part',part],attempt,attempt/'fits-check.log')
+        check_part_metadata(read(attempt/'fits-check.log'),t,manifest)
         if phase=='diagnostic' and t['face'] in (0,5):
             reference=Path(config['original'])/'pilot/corrected'/f"face-{t['face']:02d}"
             run_logged([root/'bin/validation-tools','compare-part',part,reference],attempt,attempt/'reference-check.log')
@@ -340,6 +360,8 @@ def imports(args):
             run_logged([tool,'check-face',path.parent,nside,face,manifest['target_z']],attempt,attempt/'source-check.log')
             run_logged([tool,'import-face',path.parent,part,nside,face,manifest['target_z'],manifest['redshift_tolerance'],
                         t['run_id'],json.dumps({key:manifest['variants']['corrected'][key] for key in old.PHYSICS_KEYS},separators=(',',':'))],attempt,attempt/'import.log')
+            run_logged([tool,'check-part',part],attempt,attempt/'part-check.log')
+            check_part_metadata(read(attempt/'part-check.log'),t,manifest)
             artifacts=[artifact(part),artifact(path),artifact(path.parent/'invocation.json')]
             artifacts += [artifact(path.parent/(name+f'_batch{face}.fits')) for name in ('dAmap','ellipticity1map','ellipticity2map','rotationmap','deflection1map','deflection2map','zmap','iswmap')]
             atomic(marker,{'pass':True,'task':t,'part_file':str(part),'artifacts':artifacts,'imported':True,'source':str(path)})

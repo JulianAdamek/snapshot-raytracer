@@ -27,7 +27,8 @@ def metrics(m,t):
             'first_pixel':t['first'],'pixel_count':t['count'],'subdivision_level':t['level'],'part':t['part'],
             'run_id':t['run_id'],'stage':'complete','output_format':'compact-hdf5','residency_misses':0,
             'ray_status_counts':{'success':t['count'],'nonresident storage':0},'effective_lookback_cells':10,
-            'io_mode_requested':t.get('io_mode','auto')}
+            'io_mode_requested':t.get('io_mode','auto'),
+            'io_mode':'tiles' if t.get('io_mode')=='tiles' or (t.get('io_mode','auto')=='auto' and t['face'] in (4,6)) else 'regions'}
 
 
 class CampaignTests(unittest.TestCase):
@@ -72,6 +73,15 @@ class CampaignTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):c.verified(r,m)
             p.unlink()
             with self.assertRaises(FileNotFoundError):c.verified(r,m)
+
+    def test_compact_header_binding(self):
+        m=manifest();task=c.interval(m,'corrected',4,0,1,0)
+        header={key:task[key] for key in ('nside','first','count','face','level','part','run_id')}
+        header.update(physics=m['variants']['corrected']);header['pass']=True
+        c.check_part_metadata(header,task,m)
+        for key,value in [('first',4),('run_id','b'*64),('nside',16),('physics',m['variants']['legacy'])]:
+            with self.subTest(key=key),self.assertRaises(RuntimeError):
+                c.check_part_metadata({**header,key:value},task,m)
 
     def test_claim_exclusion_and_interrupted_resume(self):
         with tempfile.TemporaryDirectory() as d,patch.dict(os.environ,{'SLURM_JOB_ID':'42'}):
@@ -118,9 +128,15 @@ class CampaignTests(unittest.TestCase):
                 calls.append(command)
                 if Path(command[0]).name=='lightcone-corrected':
                     c.atomic(directory/'run-metrics.json',metrics(m,task));(directory/'ray-part.h5').write_bytes(b'fake-artifact')
+                elif command[1]=='check-part':
+                    header={key:task[key] for key in ('nside','first','count','face','level','part','run_id')}
+                    header.update(physics=m['variants']['corrected']);header['pass']=True
+                    c.atomic(logfile,header)
                 return {'wall_seconds':1,'max_host_rss_kib':1}
+            header={key:task[key] for key in ('nside','first','count','face','level','part','run_id')}
+            header.update(physics=m['variants']['corrected']);header['pass']=True
             with patch.object(c,'load',return_value=(cfg,m)),patch.object(c,'prerequisites'),patch.object(c,'run_logged',execute),\
-                 patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0)),contextlib.redirect_stdout(io.StringIO()):
+                 patch.object(c.subprocess,'run',return_value=subprocess.CompletedProcess([],0,stdout=json.dumps(header))),contextlib.redirect_stdout(io.StringIO()):
                 c.run(args);self.assertEqual(len(calls),2)
                 c.run(args);self.assertEqual(len(calls),2) # Fully verified skip; no retracing.
                 saved=c.read(table);saved['tasks'][0]['part']=2;c.atomic(table,saved)
