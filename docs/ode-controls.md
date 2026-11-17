@@ -47,6 +47,10 @@ recompilation when these settings change, including when returning to defaults.
 Each executable prints its configuration and writes it to `run-metrics.json`.
 The JSON `physics` object records the four numeric 0/1 values.
 
+The [Alps comparison workflow](ode-comparison-alps.md) prepares frozen 2400³
+inputs and Nside 16384 maps with all four switches enabled versus disabled,
+using identical ziggurat geometry, background and numerical settings.
+
 These controls reproduce the selected ODE terms, not a bitwise reconstruction of
 the executable used for the paper. Interpolation arithmetic, redshift stopping,
 compiler options and input preparation must be controlled separately. In

@@ -1,5 +1,10 @@
 # GPU validation on Alps
 
+For the 2400³ frozen z=0.25 snapshot, Nside 16384/source z=0.5 comparison
+of all four ODE corrections on/off, use the separate
+[high-resolution ODE workflow](../docs/ode-comparison-alps.md).
+It builds both variants and provides preparation, pilot and production jobs.
+
 The current ODE defaults additionally correct nonlinear scalar factors,
 observer distance normalization and Sachs-basis transport. The new CPU bundle
 and evolving HDF5 tests and the four transport-error controls run before GPU map

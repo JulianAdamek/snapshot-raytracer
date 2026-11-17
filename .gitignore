@@ -12,6 +12,7 @@
 /tests/snapshot-reference.o
 /.build/
 /validation/validation-tools
+/validation/bin/
 
 # Generated maps, validation results and logs.
 /output/

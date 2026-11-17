@@ -383,7 +383,10 @@ int run(const Options& o) {
             << ",\"loading_seconds\":" << loading_seconds << ",\"tracing_seconds\":" << tracing_seconds
             << ",\"physics\":" << raytracer::PHYSICS_JSON << ",\"redshift_tolerance\":" << o.redshift_tolerance
             << ",\"effective_lookback_cells\":" << effective_lookback << ",\"residency_misses\":"
-            << totals[static_cast<int>(lightcone::Status::NotResident)] << "}\n";
+            << totals[static_cast<int>(lightcone::Status::NotResident)] << ",\"ray_status_counts\":{";
+    for (int s = 0; s < static_cast<int>(totals.size()); ++s)
+        metrics << (s ? "," : "") << '"' << lightcone::status_name(static_cast<lightcone::Status>(s)) << "\":" << totals[s];
+    metrics << "}}\n";
     metrics.close();
     if (!metrics) throw std::runtime_error("Cannot finish run-metrics.json");
     if (o.ziggurat && totals[static_cast<int>(lightcone::Status::NotResident)]) {

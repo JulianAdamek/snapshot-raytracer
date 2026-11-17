@@ -2,6 +2,7 @@
 #include "lightcone_maps.hpp"
 #include <cfloat>
 #include <chealpix.h>
+#include <fitsio.h>
 #include <hdf5.h>
 #include <algorithm>
 #include <array>
@@ -33,7 +34,7 @@ int grid_size(hid_t data) {
     require(dims[0] > 0 && dims[0] <= 100000 && dims[0] == dims[1] && dims[1] == dims[2], "Expected cubic snapshot");
     return static_cast<int>(dims[0]);
 }
-void prepare(const fs::path& potential, const fs::path& vector, const fs::path& output, int expected_n) {
+void prepare(const fs::path& potential, const fs::path& vector, const fs::path& output, int expected_n, int thickness = 3) {
     require(!fs::exists(output), "Fixture directory already exists; choose a new output directory");
     Handle phi_file(H5Fopen(potential.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
     Handle phi(H5Dopen2(phi_file.id, "/data", H5P_DEFAULT), H5Dclose);
@@ -51,27 +52,94 @@ void prepare(const fs::path& potential, const fs::path& vector, const fs::path& 
     Handle base_type(H5Tget_super(b_type.id), H5Tclose);
     require(H5Tget_class(base_type.id) == H5T_FLOAT, "Expected floating-point B components");
     Handle mem_type(H5Tarray_create2(H5T_NATIVE_FLOAT, 1, &components), H5Tclose);
-    const std::size_t size = static_cast<std::size_t>(n)*n*n;
-    std::vector<float> packed(3*size);
-    require(H5Dread(b.id, mem_type.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, packed.data()) >= 0, "Cannot read B snapshot");
+    // Bound preparation memory independently of N^3. Four Z layers need
+    // (3+1)*4*N*N floats, about 352 MiB at N=2400, plus HDF5 buffers.
+    const int layers = 4;
     fs::create_directories(output);
     const hsize_t dims[3] = {static_cast<hsize_t>(n), static_cast<hsize_t>(n), static_cast<hsize_t>(n)};
-    std::vector<float> component(size);
+    std::vector<std::unique_ptr<Handle>> files, datasets;
     for (int c = 0; c < 3; ++c) {
-        for (std::size_t i = 0; i < size; ++i) component[i] = packed[3*i+c];
         const auto path = output/("B"+std::to_string(c+1)+".h5");
-        Handle file(H5Fcreate(path.c_str(), H5F_ACC_EXCL, H5P_DEFAULT, H5P_DEFAULT), H5Fclose);
+        files.emplace_back(new Handle(H5Fcreate(path.c_str(), H5F_ACC_EXCL, H5P_DEFAULT, H5P_DEFAULT), H5Fclose));
         Handle space(H5Screate_simple(3, dims, nullptr), H5Sclose);
-        Handle data(H5Dcreate2(file.id, "/data", H5T_IEEE_F32LE, space.id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), H5Dclose);
-        require(H5Dwrite(data.id, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, component.data()) >= 0, "Cannot write B component");
-        for (int slot = 0; slot < 3; ++slot)
-            fs::create_symlink(path.filename(), output/("lc_B"+std::to_string(c+1)+"_"+std::to_string(slot)+".h5"));
+        datasets.emplace_back(new Handle(H5Dcreate2(files.back()->id, "/data", H5T_IEEE_F32LE,
+            space.id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT), H5Dclose));
+        for (int slot = 0; slot < thickness; ++slot)
+            fs::create_symlink(path.filename(), output/("lc_B"+std::to_string(c+1)+
+                (thickness == 1 ? "" : "_"+std::to_string(slot))+".h5"));
     }
-    for (int slot = 0; slot < 3; ++slot)
-        fs::create_symlink(fs::absolute(potential), output/("lc_phi_"+std::to_string(slot)+".h5"));
-    lightcone::Reader reader((output/"lc").string(), 3);
+    Handle source_space(H5Dget_space(b.id), H5Sclose);
+    for (int z = 0; z < n; z += layers) {
+        const hsize_t origin[3] = {static_cast<hsize_t>(z), 0, 0};
+        const hsize_t extent[3] = {static_cast<hsize_t>(std::min(layers, n-z)), dims[1], dims[2]};
+        const std::size_t count = extent[0]*extent[1]*extent[2];
+        std::vector<float> packed(3*count), component(count);
+        Handle memory(H5Screate_simple(3, extent, nullptr), H5Sclose);
+        require(H5Sselect_hyperslab(source_space.id, H5S_SELECT_SET, origin, nullptr, extent, nullptr) >= 0, "Select B slab");
+        require(H5Dread(b.id, mem_type.id, memory.id, source_space.id, H5P_DEFAULT, packed.data()) >= 0, "Read B slab");
+        for (int c = 0; c < 3; ++c) {
+            for (std::size_t i = 0; i < count; ++i) component[i] = packed[3*i+c];
+            Handle destination(H5Dget_space(datasets[c]->id), H5Sclose);
+            require(H5Sselect_hyperslab(destination.id, H5S_SELECT_SET, origin, nullptr, extent, nullptr) >= 0, "Select component slab");
+            require(H5Dwrite(datasets[c]->id, H5T_NATIVE_FLOAT, memory.id, destination.id, H5P_DEFAULT, component.data()) >= 0, "Write B slab");
+        }
+        if (z % 128 == 0) std::cout << "Converted B layers " << z << " .. " << z+extent[0] << std::endl;
+    }
+    datasets.clear(); files.clear();
+    for (int slot = 0; slot < thickness; ++slot)
+        fs::create_symlink(fs::absolute(potential), output/("lc_phi"+
+            (thickness == 1 ? std::string() : "_"+std::to_string(slot))+".h5"));
+    lightcone::Reader reader((output/"lc").string(), thickness);
     require(reader.grid_size() == n, "Prepared fixture grid mismatch");
-    std::cout << "Prepared three identical slots; source snapshots are read-only. Ngrid=" << n << '\n';
+    std::cout << "Prepared " << thickness << " frozen slots; source snapshots are read-only. Ngrid=" << n << '\n';
+}
+
+// A bounded-memory check for very large NESTED face products. Read the active
+// face only; the existing small-map tests independently check zero exterior pixels.
+void check_face(const fs::path& directory, std::int64_t nside, int face, double target) {
+    require(lightcone::valid_nside(nside) && face >= 0 && face < 12, "Invalid face check parameters");
+    const LONGLONG count = nside*nside, npix = 12*count;
+    const LONGLONG block = 1<<20;
+    std::vector<float> values(block);
+    for (int m = 0; m < lightcone::MAP_COUNT; ++m) {
+        const auto path = directory/(std::string(lightcone::MAP_NAMES[m])+"_batch"+std::to_string(face)+".fits");
+        fitsfile* file = nullptr;
+        int status = 0, hdutype = 0, any_null = 0;
+        auto checked = [&]() {
+            if (!status) return;
+            char text[FLEN_STATUS]; fits_get_errstatus(status,text);
+            if (file) { int ignored=0; fits_close_file(file,&ignored); file=nullptr; }
+            throw std::runtime_error(path.string()+": "+text);
+        };
+        fits_open_file(&file,path.c_str(),READONLY,&status); checked();
+        fits_movabs_hdu(file,2,&hdutype,&status); checked();
+        LONGLONG rows=0, side=0, repeat=0, width=0; int type=0;
+        char ordering[FLEN_VALUE] = {};
+        fits_read_key(file,TLONGLONG,"NSIDE",&side,nullptr,&status);
+        fits_read_key(file,TSTRING,"ORDERING",ordering,nullptr,&status);
+        fits_get_num_rowsll(file,&rows,&status);
+        fits_get_coltypell(file,1,&type,&repeat,&width,&status); checked();
+        const bool shape_ok = hdutype == BINARY_TBL && side == nside && std::string(ordering) == "NESTED" &&
+            type == TFLOAT && repeat > 0 && rows == npix/repeat && npix%repeat == 0;
+        if (!shape_ok) { int ignored=0; fits_close_file(file,&ignored); throw std::runtime_error("Invalid HEALPix header: "+path.string()); }
+        bool good = true;
+        for (LONGLONG offset = 0; offset < count; offset += block) {
+            const LONGLONG first = face*count+offset, size = std::min(block,count-offset);
+            float null_value = NAN;
+            fits_read_col(file,TFLOAT,1,first/repeat+1,first%repeat+1,size,&null_value,values.data(),&any_null,&status); checked();
+            good = good && !any_null;
+            for (LONGLONG i = 0; i < size; ++i) {
+                const float value = values[i];
+                good = good && std::isfinite(value) && value != static_cast<float>(HEALPIX_NULLVAL);
+                if (m == 7) good = good && value == 0.0f;
+                if (m == 6) good = good && std::fabs(static_cast<double>(value)-target) <=
+                    raytracer::DEFAULT_REDSHIFT_TOL+2*FLT_EPSILON*std::fabs(target);
+            }
+        }
+        fits_close_file(file,&status); file=nullptr; checked();
+        require(good,"Nonfinite, invalid redshift or nonzero frozen ISW in "+path.string());
+    }
+    std::cout << "{\"pass\":true,\"maps\":8,\"face\":" << face << ",\"pixels_per_map\":" << count << "}\n";
 }
 void check_fixture(const fs::path& info, int n, double observer_tau, double depth) {
     lightcone::Geometry geometry;
@@ -209,7 +277,7 @@ void self_test(const fs::path& root, const std::string& fault) {
         }
     }
     // Exercise conversion of actual array[3] float64 datasets and slot links.
-    const int n = 8;
+    const int n = 9; // Include a short final streaming slab.
     const std::size_t size = n*n*n;
     std::vector<double> source(3*size);
     for (std::size_t i = 0; i < source.size(); ++i) source[i] = (i+1)*1.23456789123e-9;
@@ -241,6 +309,15 @@ void self_test(const fs::path& root, const std::string& fault) {
     }
     require(fs::equivalent(root/"fixture"/"lc_phi_0.h5", root/"source_phi.h5"), "Potential link does not preserve source");
     require(fs::equivalent(root/"fixture"/"lc_B1_0.h5", root/"fixture"/"lc_B1_2.h5"), "Slots are not identical");
+    saved = std::cout.rdbuf(std::cerr.rdbuf());
+    prepare(root/"source_phi.h5", root/"source_B.h5", root/"fixture-single", n, 1);
+    std::cout.rdbuf(saved);
+    lightcone::Reader single((root/"fixture-single"/"lc").string(),1);
+    for (int field = 0; field < 4; ++field) {
+        const auto values = single.read_region(field,0,origin,extent);
+        for (std::size_t i = 0; i < size; ++i)
+            require(values[i] == static_cast<float>(source[field ? 3*i+field-1 : i]), "Single frozen slot conversion differs");
+    }
     compare(root/"snapshot", root/"lightcone", 4, batched ? 7 : -1, 0.1, 20, 0.005, 0.3, 0.7, strict, !strict);
 }
 void assembly_control(const fs::path& root, bool outside) {
@@ -287,9 +364,11 @@ void assemble(const fs::path& reference, const fs::path& faces, int nside, doubl
 }
 int main(int argc, char** argv) {
     try {
-        require(argc >= 2, "Modes: prepare, check-fixture, compare, compare-strict, compare-frozen, assemble, self-test");
+        require(argc >= 2, "Modes: prepare, prepare-static, check-face, check-fixture, compare, compare-strict, compare-frozen, assemble, self-test");
         const std::string mode = argv[1];
         if (mode == "prepare" && argc == 6) prepare(argv[2], argv[3], argv[4], std::stoi(argv[5]));
+        else if (mode == "prepare-static" && argc == 6) prepare(argv[2], argv[3], argv[4], std::stoi(argv[5]), 1);
+        else if (mode == "check-face" && argc == 6) check_face(argv[2],std::stoll(argv[3]),std::stoi(argv[4]),std::stod(argv[5]));
         else if (mode == "check-fixture" && argc == 6) check_fixture(argv[2], std::stoi(argv[3]), std::stod(argv[4]), std::stod(argv[5]));
         else if (mode == "compare" && argc == 11) compare(argv[2], argv[3], std::stoi(argv[4]), std::stoi(argv[5]),
                 std::stod(argv[6]), std::stod(argv[7]), std::stod(argv[8]), std::stod(argv[9]), std::stod(argv[10]),false,true);

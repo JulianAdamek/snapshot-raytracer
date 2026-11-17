@@ -62,7 +62,7 @@ tests/lightcone-reference-tests: lightcone_layout.cpp tests/lightcone-reference-
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(OMP_FLAGS) $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-reference-tests.cpp lightcone.cpp lightcone_layout.cpp tests/snapshot-reference.o $(HDF5_LIBS) -lchealpix $(LIBS)
 
 validation/validation-tools: lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp validation/validation-tools.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
-	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ validation/validation-tools.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
+	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ validation/validation-tools.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
 
 tests/lightcone-storage-tests: tests/lightcone-storage-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone.hpp lightcone_maps.hpp lightcone_sampling.hpp lightcone_ray.hpp
 	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -Wall -Wextra -Wno-unknown-pragmas -fopenmp -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-storage-tests.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
@@ -114,6 +114,7 @@ test-bundle: tests/lightcone-bundle-tests
 
 test-validation: lightcone-raytracer validation/validation-tools
 	python3 validation/test_workflow.py
+	python3 validation/test_ode_comparison.py
 
 test: test-cpu test-reference test-validation test-bundle test-variants
 
