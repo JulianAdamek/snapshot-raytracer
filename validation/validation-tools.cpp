@@ -121,7 +121,10 @@ void compare(const fs::path& snapshot, const fs::path& cone, int nside, int batc
              double distance_cells, double beta, double om, double ol, bool strict = false, bool frozen_reference = false, bool require_zero_isw = false) {
     const auto& names = lightcone::MAP_NAMES;
     const double floors[] = {1e-4, 1e-7, 1e-7, 1e-10, 1e-8, 1e-8, 3e-7, 0};
-    const double endpoint_budget = strict ? 0.0 : 2e-4/(beta*std::sqrt(om*std::pow(1+target,3)+ol));
+    const double endpoint_budget = strict ? 0.0 : 2*raytracer::DEFAULT_REDSHIFT_TOL/(beta*std::sqrt(om*std::pow(1+target,3)+ol));
+    const float upper_z=static_cast<float>(target+raytracer::DEFAULT_REDSHIFT_TOL);
+    const double output_z_tolerance=raytracer::DEFAULT_REDSHIFT_TOL+
+        std::fabs(std::nextafter(upper_z,std::numeric_limits<float>::infinity())-upper_z);
     const double relative_budget = strict ? 4*FLT_EPSILON : 1e-4+4*endpoint_budget/std::max(1.0, distance_cells);
     const std::int64_t count = batch < 0 ? 12LL*nside*nside : 1LL*nside*nside;
     const std::int64_t first = batch < 0 ? 0 : batch*count;
@@ -157,10 +160,10 @@ void compare(const fs::path& snapshot, const fs::path& cone, int nside, int batc
             if (map == 6) z_error = std::max({z_error, std::fabs(a.data[i]-target), std::fabs(b.data[i]-target)});
         }
         const double tolerance = map == 7 && frozen_reference ? 0.0 : strict ? relative_budget*reference_max+4*std::numeric_limits<float>::denorm_min() :
-                                 map == 0 ? endpoint_budget+floors[map] : map == 6 ? 1.003e-4 : floors[map]+relative_budget*reference_max;
+                                 map == 0 ? endpoint_budget+floors[map] : map == 6 ? output_z_tolerance : floors[map]+relative_budget*reference_max;
         const bool ok = nonzero_isw == 0 && invalid == 0 && mask_mismatch == 0 && outside_nonzero == 0 &&
                         (strict ? rounding_failures == 0 : maximum <= tolerance) &&
-                        (map != 6 || z_error <= 1.003e-4);
+                        (map != 6 || z_error <= output_z_tolerance);
         all_ok &= ok;
         if (map) std::cout << ',';
         std::cout << "{\"name\":\"" << names[map] << "\",\"max_abs_difference\":" << maximum

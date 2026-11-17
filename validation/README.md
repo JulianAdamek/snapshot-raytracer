@@ -1,5 +1,13 @@
 # GPU validation on Alps
 
+The current ODE defaults additionally correct nonlinear scalar factors,
+observer distance normalization and Sachs-basis transport. The new CPU bundle
+and evolving HDF5 tests and the four transport-error controls run before GPU map
+comparisons. See [ODE controls](../docs/ode-controls.md). Fresh baselines must
+record matching `physics` switches and `redshift_tolerance: 1e-8`; older corrected-
+shear-only baselines are not unchanged-output references. FITS endpoint checks
+include float32 rounding, while storage comparisons retain their strict limits.
+
 The CPU suite now includes independent legacy-writer and gasgrd-v1 shell replay,
 exact-boundary and adjacent-double cases, periodic crossings, all B offsets,
 binary geometry validation and both storage paths. `tests/lightcone-geometry-gpu`
@@ -182,7 +190,7 @@ or invalid ISW fails frozen validation, with CPU controls for these cases.
 Comparisons read the FITS `ORDERING` keyword and canonicalize to NESTED. They
 check all eight light-cone maps, reject NaN and HEALPix UNSEEN inside the selected face,
 require matching validity masks and exact zeros outside a face, and check reached
-redshift against the existing `1e-4` stopping tolerance. A face is compared against
+redshift against the `1e-8` stopping tolerance plus float32 output rounding. A face is compared against
 the full-sky snapshot; the snapshot executable's historical contiguous RING
 batch ranges are never used as face references. Full-sky maps retain the legacy
 `_batch0.fits` suffix; explicit face 0 uses that suffix in its own directory.
@@ -196,9 +204,10 @@ must report zero residency misses. Twelve-face assembly and optional RING output
 use the same strict criterion. Full and slab host integration checks additionally
 require exact equality on synthetic fields.
 
-Snapshot comparisons allow the pre-existing redshift stopping uncertainty and
+Snapshot comparisons allow the configured redshift stopping uncertainty and
 background-table interpolation error. Their distance budget is
-`2e-4 / [(cell_size_mpc*H0/c)*E(target_z)]` grid units. Shape/deflection screening
+`2e-8 / [(cell_size_mpc*H0/c)*E(target_z)]` grid units, plus the existing `1e-4`
+grid-cell floor for background interpolation. Shape/deflection screening
 uses `rtol = 1e-4 + 4*distance_budget/background_distance_cells`, with absolute
 floors `1e-7` ellipticity, `1e-10` rotation and `1e-8` deflection. Reports include
 absolute/RMS differences, relative L2 differences, scales, ordering, masks and
@@ -217,13 +226,14 @@ uenv run --view=modules prgenv-gnu/24.11:v1 -- \
   bash validation/build-alps.sh 2>&1 | tee alps-build.log
 ```
 
-This compiles both tracers, four CPU regression executables and the validation
+This compiles both tracers, the CPU regression/variant executables and the validation
 helper for ARM64/CUDA `sm_90a`, without running scientific tests on the login node.
 It discovers Cray MPICH/GTL flags and pins nvcc's host compiler to loaded GCC.
 Local `make test` runs CPU numerical, FITS and workflow controls without launching
 GPU kernels; CUDA compiles a wrapper around the snapshot source itself.
 The previous storage and time-derivative suites passed in jobs 5275307 and
-5276882. GPU validation of the static shear correction awaits the next job. CPU analytic tests
+5276882; job 5277317 passed after the static shear-sign correction. GPU validation
+of the geometry and subsequent scalar/Sachs corrections remains pending. CPU analytic tests
 cover scalar time evolution, nonuniform finite differences, mixed B derivatives,
 RHS tensor contractions, endpoint refinement and convergence across slope jumps.
 Independent source-free shear tests check the sign in both implementations,

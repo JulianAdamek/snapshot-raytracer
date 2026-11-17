@@ -243,6 +243,16 @@ void integration_tests() {
     check(z >= 0.03 && z-0.03 <= FINAL_Z_TOL, "Final-step target tolerance");
     double a; check(background_at(v, y[STATE_TAU], a) == Status::Ok, "Endpoint background");
     near(z, 0.7/a-1, 1e-14, "Homogeneous redshift a_obs/a_source");
+    v.redshift_tolerance=1e-30;
+    check(initialize(v,1.,1.2,.3,y)==Status::Ok,"Tight-tolerance observer");
+    check(trace(v,0.03141592653589793,y,z)==Status::TargetNotReached,"Unachievable precision is reported as failure");
+    v.redshift_tolerance=1e-4;
+    check(initialize(v,1.,1.2,.3,y)==Status::Ok,"Legacy-tolerance observer");
+    check(trace(v,.03,y,z)==Status::Ok && z-.03<=v.redshift_tolerance,"Runtime tolerance override");
+    v.redshift_tolerance=FINAL_Z_TOL;
+    check(initialize(v,1.,1.2,.3,y)==Status::Ok,"Overshot initial state");
+    y[STATE_LOG_KTILDE0]+=std::log1p(.1);
+    check(trace(v,.03,y,z)==Status::TargetNotReached,"Already overshot state must satisfy tolerance too");
     check(initialize(v, 1.0, 1.2, 0.3, y) == Status::Ok, "Reinitialize");
     const auto before = std::vector<double>(y, y+STATE_SIZE);
     check(rk4_step(v, y, 40.0) != Status::Ok, "Invalid RK stage rejects entire step");

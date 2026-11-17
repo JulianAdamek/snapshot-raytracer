@@ -25,6 +25,12 @@ srun --ntasks=1 --gpus-per-task=1 bash -c '
     nvidia-smi
     printf "CUDA_VISIBLE_DEVICES=%s\n" "${CUDA_VISIBLE_DEVICES:-unset}"
     ./tests/lightcone-time-tests
+    ./tests/lightcone-bundle-tests
+    ./.build/variant-0000
+    ./.build/variant-00
+    ./.build/variant-01
+    ./.build/variant-10
+    ./.build/variant-11
     ./tests/lightcone-tests
     ./tests/lightcone-geometry-tests
     ./tests/lightcone-geometry-gpu

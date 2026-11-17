@@ -4,7 +4,7 @@
 namespace lightcone {
 
 constexpr int RK4_REFINEMENT_STEPS = 24;
-constexpr double FINAL_Z_TOL = 1e-4;
+constexpr double FINAL_Z_TOL = raytracer::DEFAULT_REDSHIFT_TOL;
 
 enum RayStateIndex : int {
     STATE_X = 0,
@@ -33,7 +33,16 @@ enum RayStateIndex : int {
 };
 
 
-LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dydt[STATE_SIZE]) {
+struct GridSampler {
+    const View& view;
+    LC_HD Status operator()(int field, double tau, double x, double y, double z,
+                            float& value, float grad[3], float hessian[3][3], TimeSample* time=nullptr) const {
+        return sample(view,field,tau,x,y,z,value,grad,hessian,time);
+    }
+};
+// Tests may inject analytic fields without replacing headers or copying the optics.
+template<class Sampler>
+LC_HD inline Status ode_with_sampler(const View& view, const double y[STATE_SIZE], double dydt[STATE_SIZE], const Sampler& fields) {
     double a;
     auto status = background_at(view, y[STATE_TAU], a);
     if (status != Status::Ok) return status;
@@ -96,7 +105,7 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
     TimeSample b_time[3], w_time;
 
     float Bx;
-    status = sample(view, 1, y[STATE_TAU], x_pos, y_pos, z_pos, Bx, grad, hessian, &b_time[0]);
+    status = fields(1, y[STATE_TAU], x_pos, y_pos, z_pos, Bx, grad, hessian, &b_time[0]);
     if (status != Status::Ok) return status;
 
     ngradB[0] = grad[0] * nx;
@@ -127,7 +136,7 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
     e2gradB[2] = -0.5 * e2x * grad[2];
 
     float By;
-    status = sample(view, 2, y[STATE_TAU], x_pos, y_pos, z_pos, By, grad, hessian, &b_time[1]);
+    status = fields(2, y[STATE_TAU], x_pos, y_pos, z_pos, By, grad, hessian, &b_time[1]);
     if (status != Status::Ok) return status;
 
     ngradB[0] += grad[0] * ny;
@@ -155,7 +164,7 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
     e2gradB[2] += -0.5 * e2y * grad[2];
 
     float Bz;
-    status = sample(view, 3, y[STATE_TAU], x_pos, y_pos, z_pos, Bz, grad, hessian, &b_time[2]);
+    status = fields(3, y[STATE_TAU], x_pos, y_pos, z_pos, Bz, grad, hessian, &b_time[2]);
     if (status != Status::Ok) return status;
 
     ngradB[0] += grad[0] * nz;
@@ -187,7 +196,7 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
     e2gradB[2] += 0.5 * (e2x * grad[0] + e2y * grad[1]);
 
     float phi;
-    status = sample(view, 0, y[STATE_TAU], x_pos, y_pos, z_pos, phi, grad, hessian, &w_time);
+    status = fields(0, y[STATE_TAU], x_pos, y_pos, z_pos, phi, grad, hessian, &w_time);
     if (status != Status::Ok) return status;
     const double exp_2phi = std::exp(2.0 * static_cast<double>(phi));
     const double n_dot_grad_phi = nx * grad[0] + ny * grad[1] + nz * grad[2];
@@ -197,35 +206,41 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
     dydt[STATE_Y] = -ny * exp_2phi - By;
     dydt[STATE_Z] = -nz * exp_2phi - Bz;
 
-    dydt[STATE_NX] = -(transverse_projector[0][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[0][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[0][2] * (2 * grad[2] + ngradB[2]));
-    dydt[STATE_NY] = -(transverse_projector[1][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[1][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[1][2] * (2 * grad[2] + ngradB[2]));
-    dydt[STATE_NZ] = -(transverse_projector[2][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[2][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[2][2] * (2 * grad[2] + ngradB[2]));
+    double scalar_gradient[3], scalar_tidal[3][3];
+    raytracer::scalar_jets(exp_2phi, grad, hessian, scalar_gradient, scalar_tidal);
+    const double static_transport = RT_NONLINEAR_SCALAR ? dlogktilde_dt :
+        4.0*(nx*scalar_gradient[0]+ny*scalar_gradient[1]+nz*scalar_gradient[2]) +
+        nx*ngradB[0]+ny*ngradB[1]+nz*ngradB[2];
 
-    dydt[STATE_E1X] = -2 * nx * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nx * e1ngradB;
-    dydt[STATE_E1Y] = -2 * ny * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - ny * e1ngradB;
-    dydt[STATE_E1Z] = -2 * nz * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nz * e1ngradB;
+    dydt[STATE_NX] = -(transverse_projector[0][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[0][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[0][2] * (2 * scalar_gradient[2] + ngradB[2]));
+    dydt[STATE_NY] = -(transverse_projector[1][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[1][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[1][2] * (2 * scalar_gradient[2] + ngradB[2]));
+    dydt[STATE_NZ] = -(transverse_projector[2][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[2][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[2][2] * (2 * scalar_gradient[2] + ngradB[2]));
 
-    dydt[STATE_E2X] = -2 * nx * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nx * e2ngradB;
-    dydt[STATE_E2Y] = -2 * ny * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - ny * e2ngradB;
-    dydt[STATE_E2Z] = -2 * nz * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nz * e2ngradB;
+    dydt[STATE_E1X] = -2 * nx * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - nx * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[0] : 0.0);
+    dydt[STATE_E1Y] = -2 * ny * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - ny * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[1] : 0.0);
+    dydt[STATE_E1Z] = -2 * nz * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - nz * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[2] : 0.0);
+
+    dydt[STATE_E2X] = -2 * nx * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - nx * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[0] : 0.0);
+    dydt[STATE_E2Y] = -2 * ny * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - ny * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[1] : 0.0);
+    dydt[STATE_E2Z] = -2 * nz * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - nz * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[2] : 0.0);
 
     dydt[STATE_DA] = -dAprime;
-    dydt[STATE_DA_PRIME] = -4 * dAprime * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) - (transverse_projector[0][0] * hessian[0][0] + transverse_projector[0][1] * hessian[0][1] + transverse_projector[0][2] * hessian[0][2] + transverse_projector[1][0] * hessian[1][0] + transverse_projector[1][1] * hessian[1][1] + transverse_projector[1][2] * hessian[1][2] + transverse_projector[2][0] * hessian[2][0] + transverse_projector[2][1] * hessian[2][1] + transverse_projector[2][2] * hessian[2][2]) * dA + 0.5 * nLaplaceB * dA;
+    dydt[STATE_DA_PRIME] = -static_transport * dAprime - (transverse_projector[0][0] * scalar_tidal[0][0] + transverse_projector[0][1] * scalar_tidal[0][1] + transverse_projector[0][2] * scalar_tidal[0][2] + transverse_projector[1][0] * scalar_tidal[1][0] + transverse_projector[1][1] * scalar_tidal[1][1] + transverse_projector[1][2] * scalar_tidal[1][2] + transverse_projector[2][0] * scalar_tidal[2][0] + transverse_projector[2][1] * scalar_tidal[2][1] + transverse_projector[2][2] * scalar_tidal[2][2]) * dA + 0.5 * nLaplaceB * dA;
 
-    hessian[0][0] += 0.5 * tidalBterm[0][0];
-    hessian[0][1] += 0.5 * tidalBterm[0][1];
-    hessian[0][2] += 0.5 * tidalBterm[0][2];
-    hessian[1][0] += 0.5 * tidalBterm[1][0];
-    hessian[1][1] += 0.5 * tidalBterm[1][1];
-    hessian[1][2] += 0.5 * tidalBterm[1][2];
-    hessian[2][0] += 0.5 * tidalBterm[2][0];
-    hessian[2][1] += 0.5 * tidalBterm[2][1];
-    hessian[2][2] += 0.5 * tidalBterm[2][2];
+    scalar_tidal[0][0] += 0.5 * tidalBterm[0][0];
+    scalar_tidal[0][1] += 0.5 * tidalBterm[0][1];
+    scalar_tidal[0][2] += 0.5 * tidalBterm[0][2];
+    scalar_tidal[1][0] += 0.5 * tidalBterm[1][0];
+    scalar_tidal[1][1] += 0.5 * tidalBterm[1][1];
+    scalar_tidal[1][2] += 0.5 * tidalBterm[1][2];
+    scalar_tidal[2][0] += 0.5 * tidalBterm[2][0];
+    scalar_tidal[2][1] += 0.5 * tidalBterm[2][1];
+    scalar_tidal[2][2] += 0.5 * tidalBterm[2][2];
 
     // Backward transport: d(sigma)/ds = -d(log ktilde0)/ds * sigma + tidal source.
     // Ellipticity sign conventions do not change this homogeneous coefficient.
-    dydt[STATE_SIGMA1] = -4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
-    dydt[STATE_SIGMA2] = -4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
+    dydt[STATE_SIGMA1] = (RT_CORRECT_SHEAR_TRANSPORT ? -static_transport : static_transport) * sigma1 + (shear_projector1[0][0] * scalar_tidal[0][0] + shear_projector1[0][1] * scalar_tidal[0][1] + shear_projector1[0][2] * scalar_tidal[0][2] + shear_projector1[1][0] * scalar_tidal[1][0] + shear_projector1[1][1] * scalar_tidal[1][1] + shear_projector1[1][2] * scalar_tidal[1][2] + shear_projector1[2][0] * scalar_tidal[2][0] + shear_projector1[2][1] * scalar_tidal[2][1] + shear_projector1[2][2] * scalar_tidal[2][2]) * dA * dA;
+    dydt[STATE_SIGMA2] = (RT_CORRECT_SHEAR_TRANSPORT ? -static_transport : static_transport) * sigma2 + (shear_projector2[0][0] * scalar_tidal[0][0] + shear_projector2[0][1] * scalar_tidal[0][1] + shear_projector2[0][2] * scalar_tidal[0][2] + shear_projector2[1][0] * scalar_tidal[1][0] + shear_projector2[1][1] * scalar_tidal[1][1] + shear_projector2[1][2] * scalar_tidal[1][2] + shear_projector2[2][0] * scalar_tidal[2][0] + shear_projector2[2][1] * scalar_tidal[2][1] + shear_projector2[2][2] * scalar_tidal[2][2]) * dA * dA;
 
     if (dA > 0.5)
     {
@@ -272,6 +287,10 @@ LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dyd
 }
 
 
+LC_HD inline Status ode(const View& view, const double y[STATE_SIZE], double dydt[STATE_SIZE]) {
+    return ode_with_sampler(view,y,dydt,GridSampler{view});
+}
+
 LC_HD inline void copy_state(double* dst, const double* src) {
     for (int i = 0; i < STATE_SIZE; ++i) dst[i] = src[i];
 }
@@ -285,7 +304,8 @@ LC_HD inline Status observed_redshift(const View& view, const double y[STATE_SIZ
     z = std::exp(3.0*static_cast<double>(phi)+y[STATE_LOG_KTILDE0])/a-1.0;
     return finite(z) ? Status::Ok : Status::InvalidValue;
 }
-LC_HD inline Status initialize(const View& view, double tau, double theta, double phi, double y[STATE_SIZE]) {
+template<class Sampler>
+LC_HD inline Status initialize_with_sampler(const View& view, double tau, double theta, double phi, double y[STATE_SIZE], const Sampler& fields) {
     for (int i = 0; i < STATE_SIZE; ++i) y[i] = 0.0;
     for (int axis = 0; axis < 3; ++axis) y[STATE_X+axis] = view.geometry.vertex[axis]*view.n;
     y[STATE_NX] = -std::sin(theta)*std::cos(phi);
@@ -302,9 +322,16 @@ LC_HD inline Status initialize(const View& view, double tau, double theta, doubl
     auto status = background_at(view, tau, a);
     if (status != Status::Ok) return status;
     float potential, grad[3], hessian[3][3];
-    status = sample(view, 0, tau, y[STATE_X], y[STATE_Y], y[STATE_Z], potential, grad, hessian);
-    if (status == Status::Ok) y[STATE_LOG_KTILDE0] = std::log(a)-3.0*potential;
+    status = fields(0, tau, y[STATE_X], y[STATE_Y], y[STATE_Z], potential, grad, hessian);
+    if (status == Status::Ok) {
+        y[STATE_LOG_KTILDE0] = std::log(a)-3.0*potential;
+        y[STATE_DA_PRIME] = raytracer::observer_distance_prime(potential);
+    }
     return status;
+}
+
+LC_HD inline Status initialize(const View& view, double tau, double theta, double phi, double y[STATE_SIZE]) {
+    return initialize_with_sampler(view,tau,theta,phi,y,GridSampler{view});
 }
 
 // Clamp only roundoff at the last background knot, never a genuine extrapolation.
@@ -315,23 +342,24 @@ LC_HD inline double stage_tau(const View& view, double tau) {
 }
 
 // Transactional: no ray state changes unless all four stages succeed.
-LC_HD inline Status rk4_step(const View& view, double y[STATE_SIZE], double dt) {
+template<class Sampler>
+LC_HD inline Status rk4_step_with_sampler(const View& view, double y[STATE_SIZE], double dt, const Sampler& fields) {
     if (!finite(dt) || dt <= 0.0) return Status::InvalidValue;
     double temp[STATE_SIZE], k1[STATE_SIZE], k2[STATE_SIZE], k3[STATE_SIZE], k4[STATE_SIZE];
-    auto status = ode(view, y, k1);
+    auto status = ode_with_sampler(view, y, k1, fields);
     if (status != Status::Ok) return status;
     if (dt > (y[STATE_TAU]-integration_lower_bound(view))*view.n) return Status::BackgroundCoverage;
     for (int i = 0; i < STATE_SIZE; ++i) temp[i] = y[i]+0.5*dt*k1[i];
     temp[STATE_TAU] = stage_tau(view, y[STATE_TAU]-0.5*dt/view.n);
-    status = ode(view, temp, k2);
+    status = ode_with_sampler(view, temp, k2, fields);
     if (status != Status::Ok) return status;
     for (int i = 0; i < STATE_SIZE; ++i) temp[i] = y[i]+0.5*dt*k2[i];
     temp[STATE_TAU] = stage_tau(view, y[STATE_TAU]-0.5*dt/view.n);
-    status = ode(view, temp, k3);
+    status = ode_with_sampler(view, temp, k3, fields);
     if (status != Status::Ok) return status;
     for (int i = 0; i < STATE_SIZE; ++i) temp[i] = y[i]+dt*k3[i];
     temp[STATE_TAU] = stage_tau(view, y[STATE_TAU]-dt/view.n);
-    status = ode(view, temp, k4);
+    status = ode_with_sampler(view, temp, k4, fields);
     if (status != Status::Ok) return status;
     for (int i = 0; i < STATE_SIZE; ++i) {
         temp[i] = y[i]+(dt/6.0)*(k1[i]+2.0*k2[i]+2.0*k3[i]+k4[i]);
@@ -341,16 +369,20 @@ LC_HD inline Status rk4_step(const View& view, double y[STATE_SIZE], double dt) 
     copy_state(y, temp);
     return Status::Ok;
 }
+LC_HD inline Status rk4_step(const View& view, double y[STATE_SIZE], double dt) {
+    return rk4_step_with_sampler(view,y,dt,GridSampler{view});
+}
 LC_HD inline Status trace(const View& view, double target_z, double y[STATE_SIZE], double& reached_z) {
     reached_z = NAN;
-    if (!finite(target_z) || target_z <= 0.0) return Status::InvalidValue;
+    if (!finite(view.redshift_tolerance) || view.redshift_tolerance <= 0.0 || !finite(target_z) || target_z <= 0.0) return Status::InvalidValue;
     auto status = observed_redshift(view, y, reached_z);
     if (status != Status::Ok) return status;
     const double span = (y[STATE_TAU]-integration_lower_bound(view))*view.n;
     if (!finite(span) || span < 0.0 || span > 4e18) return Status::InvalidValue;
     const auto max_steps = static_cast<std::int64_t>(std::ceil(span))+1;
     for (std::int64_t step = 0; step < max_steps; ++step) {
-        if (reached_z >= target_z) return Status::Ok;
+        if (reached_z >= target_z)
+            return std::fabs(reached_z-target_z) <= view.redshift_tolerance ? Status::Ok : Status::TargetNotReached;
         const double remaining = (y[STATE_TAU]-integration_lower_bound(view))*view.n;
         if (remaining <= 0.0) break;
         const double dt = std::fmin(1.0, remaining);
@@ -364,7 +396,7 @@ LC_HD inline Status trace(const View& view, double target_z, double y[STATE_SIZE
         if (status != Status::Ok) return status;
         if (next_z >= target_z) {
             double low = 0.0, high = dt;
-            for (int iter = 0; iter < RK4_REFINEMENT_STEPS && std::fabs(next_z-target_z) > FINAL_Z_TOL; ++iter) {
+            for (int iter = 0; iter < RK4_REFINEMENT_STEPS && std::fabs(next_z-target_z) > view.redshift_tolerance; ++iter) {
                 const double mid = 0.5*(low+high);
                 double refined[STATE_SIZE];
                 copy_state(refined, y);
@@ -376,7 +408,7 @@ LC_HD inline Status trace(const View& view, double target_z, double y[STATE_SIZE
                 if (mid_z >= target_z) { high = mid; copy_state(candidate, refined); next_z = mid_z; }
                 else low = mid;
             }
-            if (std::fabs(next_z-target_z) > FINAL_Z_TOL) return Status::TargetNotReached;
+            if (std::fabs(next_z-target_z) > view.redshift_tolerance) return Status::TargetNotReached;
         }
         copy_state(y, candidate);
         reached_z = next_z;

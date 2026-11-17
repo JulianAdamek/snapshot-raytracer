@@ -1,5 +1,6 @@
 # Executables and object files.
 /snapshot-raytracer
+/snapshot-ode-*
 /lightcone-raytracer
 /tests/lightcone-tests
 /tests/lightcone-reference-tests
@@ -7,7 +8,9 @@
 /tests/lightcone-time-tests
 /tests/lightcone-geometry-tests
 /tests/lightcone-geometry-gpu
+/tests/lightcone-bundle-tests
 /tests/snapshot-reference.o
+/.build/
 /validation/validation-tools
 
 # Generated maps, validation results and logs.

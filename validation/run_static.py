@@ -17,6 +17,9 @@ import sys
 import time
 
 C_KM_S = 299792.458
+EXPECTED_PHYSICS = {'correct_shear_transport':1,'correct_sachs_b':1,'nonlinear_scalar':1,'correct_observer_distance':1}
+REDSHIFT_TOLERANCE = 1e-8
+
 MASS_OMEGA_EV = 93.14  # gevolution metadata.hpp
 
 
@@ -200,6 +203,8 @@ def main():
         saved = json.loads((baseline/'manifest.json').read_text())
         if saved.get('static_shear_transport') != 'negative':
             parser.error('Baseline predates the static shear-sign correction; use a corrected run or omit --baseline-run')
+        if saved.get('physics') != EXPECTED_PHYSICS or saved.get('redshift_tolerance') != REDSHIFT_TOLERANCE:
+            parser.error('Baseline uses different ODE corrections or redshift tolerance; generate a fresh baseline')
         if (saved['nside'] != args.nside or saved['snapshot_index'] != args.snapshot or
             saved['configuration'] != config or any(z not in saved['targets'] for z in args.targets)):
             parser.error('Baseline Nside, snapshot, cosmology or targets do not match this run')
@@ -222,11 +227,12 @@ def main():
                 'time_derivative_modes': ['finite-difference','zero'] if args.validate_isw else ['finite-difference'],
                 'frozen_baseline': str(baseline) if baseline else None,
                 'static_shear_transport': 'negative', 'shell_geometry': 'legacy',
+                'physics': EXPECTED_PHYSICS, 'redshift_tolerance': REDSHIFT_TOLERANCE,
                 'background_model': 'flat matter + Lambda; radiation excluded identically from both tracers',
                 'input_settings': str(Path(settings).resolve()),
                 'inputs': [{'path': str(p), 'bytes': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns} for p in (potential, vector)],
                 'source_sha256': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                                  for p in list(root.glob('*.cu'))+list(root.glob('lightcone*.*'))+[root/'lccube_geometry.h'] if p.is_file()},
+                                  for p in list(root.glob('*.cu'))+list(root.glob('lightcone*.*'))+[root/'lccube_geometry.h',root/'raytracer_physics.hpp'] if p.is_file()},
                 'slurm_job_id': os.environ.get('SLURM_JOB_ID'), 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
     write_json(run/'manifest.json', manifest)
     run_logged([tool, 'prepare', potential, vector, run/'fixture', config['ngrid']], root, run/'prepare.log')
@@ -257,6 +263,8 @@ def main():
             command += ['--max-lookback-cells', args.max_lookback_cells]
         process = run_logged(command, directory, directory/'lightcone.log')
         tracer = json.loads((directory/'run-metrics.json').read_text())
+        if tracer.get('physics') != EXPECTED_PHYSICS or tracer.get('redshift_tolerance') != REDSHIFT_TOLERANCE:
+            raise RuntimeError(f'Incorrect ODE configuration in {directory}')
         if tracer.get('static_shear_transport') != 'negative':
             raise RuntimeError(f'Tracer binary lacks the static shear-sign correction in {directory}')
         if tracer.get('shell_geometry') != 'legacy':
@@ -278,6 +286,9 @@ def main():
                               '--target-z', target, '--box-size-mpc', config['box_mpc'],
                               '--omega-m', config['omega_m'], '--omega-lambda', config['omega_lambda'],
                               '--h0', config['h0_km_s_mpc']], snapshot_dir, reference/'snapshot.log')
+        snapshot_metrics=json.loads((snapshot_dir/'run-metrics.json').read_text())
+        if snapshot_metrics.get('physics') != EXPECTED_PHYSICS or snapshot_metrics.get('redshift_tolerance') != REDSHIFT_TOLERANCE:
+            raise RuntimeError('Snapshot reference has different ODE corrections or tolerance')
         summary['executions'].append({'directory': str(snapshot_dir), 'process': process, 'storage': 'snapshot'})
         cone_dir = cone_case(reference/'lightcone', target)
         report = compare_logged([tool, 'compare', snapshot_dir, cone_dir, args.nside, -1, target,

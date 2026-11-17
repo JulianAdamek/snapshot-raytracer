@@ -1,3 +1,6 @@
+#include "raytracer_physics.hpp"
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -23,7 +26,7 @@
 
 constexpr double SPEED_OF_LIGHT_KM_PER_S = 299792.458;
 constexpr int RK4_REFINEMENT_STEPS = 24;
-constexpr double FINAL_Z_TOL = 1e-4;
+constexpr double FINAL_Z_TOL = raytracer::DEFAULT_REDSHIFT_TOL;
 
 enum RayStateIndex : int {
     STATE_X = 0,
@@ -57,6 +60,7 @@ struct RayIntegrationConfig {
     double omega_m;
     double omega_lambda;
     int max_steps;
+    double redshift_tolerance = FINAL_Z_TOL;
 };
 
 __host__ __device__ inline double background_e(const RayIntegrationConfig& config, double z) {
@@ -289,9 +293,14 @@ __host__ __device__ float tricubic_interpolation(const T * data, const int * dim
     long long iz = static_cast<long long>(std::floor(z));
 
     // Compute local coordinates within the cell
-    float dx = static_cast<float>(x) - static_cast<float>(ix);
-    float dy = static_cast<float>(y) - static_cast<float>(iy);
-    float dz = static_cast<float>(z) - static_cast<float>(iz);
+    float dx = static_cast<float>(x - ix);
+    float dy = static_cast<float>(y - iy);
+    float dz = static_cast<float>(z - iz);
+    // Canonicalize after extracting the fraction. The old +20*N addressing
+    // offset alone did not support negative positions more than 20 boxes away.
+    ix = (ix % nx + nx) % nx;
+    iy = (iy % ny + ny) % ny;
+    iz = (iz % nz + nz) % nz;
 
     // 1) along x
     float tmp_yz[4][4];
@@ -544,35 +553,41 @@ __host__ __device__ void raytracing_ode(const double y[STATE_SIZE], double dydt[
     dydt[STATE_Y] = -ny * exp_2phi - By;
     dydt[STATE_Z] = -nz * exp_2phi - Bz;
 
-    dydt[STATE_NX] = -(transverse_projector[0][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[0][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[0][2] * (2 * grad[2] + ngradB[2]));
-    dydt[STATE_NY] = -(transverse_projector[1][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[1][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[1][2] * (2 * grad[2] + ngradB[2]));
-    dydt[STATE_NZ] = -(transverse_projector[2][0] * (2 * grad[0] + ngradB[0]) + transverse_projector[2][1] * (2 * grad[1] + ngradB[1]) + transverse_projector[2][2] * (2 * grad[2] + ngradB[2]));
+    double scalar_gradient[3], scalar_tidal[3][3];
+    raytracer::scalar_jets(exp_2phi, grad, hessian, scalar_gradient, scalar_tidal);
+    const double static_transport = RT_NONLINEAR_SCALAR ? dlogktilde_dt :
+        4.0*(nx*scalar_gradient[0]+ny*scalar_gradient[1]+nz*scalar_gradient[2]) +
+        nx*ngradB[0]+ny*ngradB[1]+nz*ngradB[2];
 
-    dydt[STATE_E1X] = -2 * nx * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nx * e1ngradB;
-    dydt[STATE_E1Y] = -2 * ny * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - ny * e1ngradB;
-    dydt[STATE_E1Z] = -2 * nz * (e1x * grad[0] + e1y * grad[1] + e1z * grad[2]) - nz * e1ngradB;
+    dydt[STATE_NX] = -(transverse_projector[0][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[0][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[0][2] * (2 * scalar_gradient[2] + ngradB[2]));
+    dydt[STATE_NY] = -(transverse_projector[1][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[1][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[1][2] * (2 * scalar_gradient[2] + ngradB[2]));
+    dydt[STATE_NZ] = -(transverse_projector[2][0] * (2 * scalar_gradient[0] + ngradB[0]) + transverse_projector[2][1] * (2 * scalar_gradient[1] + ngradB[1]) + transverse_projector[2][2] * (2 * scalar_gradient[2] + ngradB[2]));
 
-    dydt[STATE_E2X] = -2 * nx * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nx * e2ngradB;
-    dydt[STATE_E2Y] = -2 * ny * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - ny * e2ngradB;
-    dydt[STATE_E2Z] = -2 * nz * (e2x * grad[0] + e2y * grad[1] + e2z * grad[2]) - nz * e2ngradB;
+    dydt[STATE_E1X] = -2 * nx * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - nx * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[0] : 0.0);
+    dydt[STATE_E1Y] = -2 * ny * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - ny * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[1] : 0.0);
+    dydt[STATE_E1Z] = -2 * nz * (e1x * scalar_gradient[0] + e1y * scalar_gradient[1] + e1z * scalar_gradient[2]) - nz * e1ngradB - (RT_CORRECT_SACHS_B ? e1gradB[2] : 0.0);
+
+    dydt[STATE_E2X] = -2 * nx * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - nx * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[0] : 0.0);
+    dydt[STATE_E2Y] = -2 * ny * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - ny * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[1] : 0.0);
+    dydt[STATE_E2Z] = -2 * nz * (e2x * scalar_gradient[0] + e2y * scalar_gradient[1] + e2z * scalar_gradient[2]) - nz * e2ngradB - (RT_CORRECT_SACHS_B ? e2gradB[2] : 0.0);
 
     dydt[STATE_DA] = -dAprime;
-    dydt[STATE_DA_PRIME] = -4 * dAprime * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) - (transverse_projector[0][0] * hessian[0][0] + transverse_projector[0][1] * hessian[0][1] + transverse_projector[0][2] * hessian[0][2] + transverse_projector[1][0] * hessian[1][0] + transverse_projector[1][1] * hessian[1][1] + transverse_projector[1][2] * hessian[1][2] + transverse_projector[2][0] * hessian[2][0] + transverse_projector[2][1] * hessian[2][1] + transverse_projector[2][2] * hessian[2][2]) * dA + 0.5 * nLaplaceB * dA;
+    dydt[STATE_DA_PRIME] = -static_transport * dAprime - (transverse_projector[0][0] * scalar_tidal[0][0] + transverse_projector[0][1] * scalar_tidal[0][1] + transverse_projector[0][2] * scalar_tidal[0][2] + transverse_projector[1][0] * scalar_tidal[1][0] + transverse_projector[1][1] * scalar_tidal[1][1] + transverse_projector[1][2] * scalar_tidal[1][2] + transverse_projector[2][0] * scalar_tidal[2][0] + transverse_projector[2][1] * scalar_tidal[2][1] + transverse_projector[2][2] * scalar_tidal[2][2]) * dA + 0.5 * nLaplaceB * dA;
 
-    hessian[0][0] += 0.5 * tidalBterm[0][0];
-    hessian[0][1] += 0.5 * tidalBterm[0][1];
-    hessian[0][2] += 0.5 * tidalBterm[0][2];
-    hessian[1][0] += 0.5 * tidalBterm[1][0];
-    hessian[1][1] += 0.5 * tidalBterm[1][1];
-    hessian[1][2] += 0.5 * tidalBterm[1][2];
-    hessian[2][0] += 0.5 * tidalBterm[2][0];
-    hessian[2][1] += 0.5 * tidalBterm[2][1];
-    hessian[2][2] += 0.5 * tidalBterm[2][2];
+    scalar_tidal[0][0] += 0.5 * tidalBterm[0][0];
+    scalar_tidal[0][1] += 0.5 * tidalBterm[0][1];
+    scalar_tidal[0][2] += 0.5 * tidalBterm[0][2];
+    scalar_tidal[1][0] += 0.5 * tidalBterm[1][0];
+    scalar_tidal[1][1] += 0.5 * tidalBterm[1][1];
+    scalar_tidal[1][2] += 0.5 * tidalBterm[1][2];
+    scalar_tidal[2][0] += 0.5 * tidalBterm[2][0];
+    scalar_tidal[2][1] += 0.5 * tidalBterm[2][1];
+    scalar_tidal[2][2] += 0.5 * tidalBterm[2][2];
 
     // Backward transport: d(sigma)/ds = -d(log ktilde0)/ds * sigma + tidal source.
     // Ellipticity sign conventions do not change this homogeneous coefficient.
-    dydt[STATE_SIGMA1] = -4 * sigma1 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector1[0][0] * hessian[0][0] + shear_projector1[0][1] * hessian[0][1] + shear_projector1[0][2] * hessian[0][2] + shear_projector1[1][0] * hessian[1][0] + shear_projector1[1][1] * hessian[1][1] + shear_projector1[1][2] * hessian[1][2] + shear_projector1[2][0] * hessian[2][0] + shear_projector1[2][1] * hessian[2][1] + shear_projector1[2][2] * hessian[2][2]) * dA * dA;
-    dydt[STATE_SIGMA2] = -4 * sigma2 * (nx * grad[0] + ny * grad[1] + nz * grad[2] + 0.25 * (nx * ngradB[0] + ny * ngradB[1] + nz * ngradB[2])) + (shear_projector2[0][0] * hessian[0][0] + shear_projector2[0][1] * hessian[0][1] + shear_projector2[0][2] * hessian[0][2] + shear_projector2[1][0] * hessian[1][0] + shear_projector2[1][1] * hessian[1][1] + shear_projector2[1][2] * hessian[1][2] + shear_projector2[2][0] * hessian[2][0] + shear_projector2[2][1] * hessian[2][1] + shear_projector2[2][2] * hessian[2][2]) * dA * dA;
+    dydt[STATE_SIGMA1] = (RT_CORRECT_SHEAR_TRANSPORT ? -static_transport : static_transport) * sigma1 + (shear_projector1[0][0] * scalar_tidal[0][0] + shear_projector1[0][1] * scalar_tidal[0][1] + shear_projector1[0][2] * scalar_tidal[0][2] + shear_projector1[1][0] * scalar_tidal[1][0] + shear_projector1[1][1] * scalar_tidal[1][1] + shear_projector1[1][2] * scalar_tidal[1][2] + shear_projector1[2][0] * scalar_tidal[2][0] + shear_projector1[2][1] * scalar_tidal[2][1] + shear_projector1[2][2] * scalar_tidal[2][2]) * dA * dA;
+    dydt[STATE_SIGMA2] = (RT_CORRECT_SHEAR_TRANSPORT ? -static_transport : static_transport) * sigma2 + (shear_projector2[0][0] * scalar_tidal[0][0] + shear_projector2[0][1] * scalar_tidal[0][1] + shear_projector2[0][2] * scalar_tidal[0][2] + shear_projector2[1][0] * scalar_tidal[1][0] + shear_projector2[1][1] * scalar_tidal[1][1] + shear_projector2[1][2] * scalar_tidal[1][2] + shear_projector2[2][0] * scalar_tidal[2][0] + shear_projector2[2][1] * scalar_tidal[2][1] + shear_projector2[2][2] * scalar_tidal[2][2]) * dA * dA;
 
     if (dA > 0.5)
     {
@@ -627,13 +642,14 @@ __host__ __device__ void rk4_step(const float * data, const __half * B1data, con
 
 __host__ __device__ bool raytracing(const float * data, const __half * B1data, const __half * B2data, const __half * B3data,
                                     const int * dims, const RayIntegrationConfig& config, double y[STATE_SIZE], double* reached_z) {
+    if (!std::isfinite(config.redshift_tolerance) || config.redshift_tolerance <= 0.0) return false;
     double previous_state[STATE_SIZE];
     double refined_state[STATE_SIZE];
     double last_reached_z = observed_redshift_from_state(y, data, dims);
 
     if (last_reached_z >= config.target_z) {
         *reached_z = last_reached_z;
-        return true;
+        return std::fabs(last_reached_z-config.target_z) <= config.redshift_tolerance;
     }
 
     for (int step = 0; step < config.max_steps; ++step) {
@@ -646,7 +662,7 @@ __host__ __device__ bool raytracing(const float * data, const __half * B1data, c
             double low = 0.0;
             double high = 1.0;
             copy_state(refined_state, y);
-            for (int iter = 0; iter < RK4_REFINEMENT_STEPS && std::fabs(last_reached_z - config.target_z) > FINAL_Z_TOL; ++iter) {
+            for (int iter = 0; iter < RK4_REFINEMENT_STEPS && std::fabs(last_reached_z - config.target_z) > config.redshift_tolerance; ++iter) {
                 const double mid = 0.5 * (low + high);
                 copy_state(refined_state, previous_state);
                 rk4_step(data, B1data, B2data, B3data, dims, refined_state, mid, config);
@@ -661,7 +677,7 @@ __host__ __device__ bool raytracing(const float * data, const __half * B1data, c
                 }
             }
             *reached_z = last_reached_z;
-            return true;
+            return std::isfinite(last_reached_z) && std::fabs(last_reached_z-config.target_z) <= config.redshift_tolerance;
         }
 
         // A temporary gravitational blueshift can decrease the observed redshift.
@@ -695,6 +711,7 @@ __global__ void raytracing_kernel(const float * data, const __half * B1data, con
     float hessian[3][3];
     const float phi_observer = tricubic_interpolation(data, dims, y[STATE_X], y[STATE_Y], y[STATE_Z], grad, hessian);
     y[STATE_LOG_KTILDE0] = -3.0 * static_cast<double>(phi_observer);
+    y[STATE_DA_PRIME] = raytracer::observer_distance_prime(phi_observer);
     y[STATE_BACKGROUND_Z] = 0.0;
 
     double reached_z = 0.0;
@@ -748,7 +765,7 @@ __global__ void vector3_to_half(const float * vec3, __half * h1, __half * h2, __
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <hdf5_file_potential> <hdf5_file_B> <Nside>"
-                  << " --target-z <z> --box-size-mpc <L> --omega-m <Om> --omega-lambda <Ol> --h0 <km/s/Mpc> [--batch <n>]" << std::endl;
+                  << " --target-z <z> --box-size-mpc <L> --omega-m <Om> --omega-lambda <Ol> --h0 <km/s/Mpc> [--batch <n>] [--redshift-tol <tol>]" << std::endl;
         return -1;
     }
 
@@ -765,6 +782,7 @@ int main(int argc, char* argv[]) {
     double omega_m = -1.0;
     double omega_lambda = -1.0;
     double h0 = -1.0;
+    double redshift_tolerance = FINAL_Z_TOL;
     int batch = -1;
 
     for (int argi = 4; argi < argc; ++argi) {
@@ -774,6 +792,9 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--box-size-mpc" && argi + 1 < argc) {
             box_size_mpc = std::stod(argv[++argi]);
+        }
+        else if (arg == "--redshift-tol" && argi + 1 < argc) {
+            redshift_tolerance = std::stod(argv[++argi]);
         }
         else if (arg == "--omega-m" && argi + 1 < argc) {
             omega_m = std::stod(argv[++argi]);
@@ -795,6 +816,10 @@ int main(int argc, char* argv[]) {
 
     if (target_z <= 0.0) {
         std::cerr << "Invalid --target-z value: " << target_z << std::endl;
+        return -1;
+    }
+    if (!std::isfinite(redshift_tolerance) || redshift_tolerance <= 0.0) {
+        std::cerr << "Redshift tolerance must be positive and finite." << std::endl;
         return -1;
     }
     if (box_size_mpc <= 0.0) {
@@ -820,6 +845,7 @@ int main(int argc, char* argv[]) {
     std::cout << "omega_m: " << omega_m << std::endl;
     std::cout << "omega_lambda: " << omega_lambda << std::endl;
     std::cout << "h0: " << h0 << " km/s/Mpc" << std::endl;
+    std::cout << "ODE corrections: " << raytracer::PHYSICS_JSON << "; redshift tolerance: " << redshift_tolerance << std::endl;
     std::cout << "Loading potential data from HDF5 file " << potential_filename << " ..." << std::endl;
 
     std::string filename = potential_filename;
@@ -853,6 +879,7 @@ int main(int argc, char* argv[]) {
     ray_config.h0_over_c = h0 / SPEED_OF_LIGHT_KM_PER_S;
     ray_config.omega_m = omega_m;
     ray_config.omega_lambda = omega_lambda;
+    ray_config.redshift_tolerance = redshift_tolerance;
     const double chi_target_mpc = comoving_distance_mpc(target_z, omega_m, omega_lambda, ray_config.h0_over_c);
     ray_config.max_steps = static_cast<int>(std::ceil(chi_target_mpc / ray_config.cell_size_mpc)) + 32;
     if (ray_config.max_steps <= 0) {
@@ -1219,6 +1246,11 @@ int main(int argc, char* argv[]) {
     data.clear();
     dims.clear();
 
+    std::ofstream metrics("run-metrics.json");
+    metrics << std::setprecision(17) << "{\"physics\":" << raytracer::PHYSICS_JSON
+            << ",\"redshift_tolerance\":" << redshift_tolerance << ",\"target_z\":" << target_z << "}\n";
+    metrics.close();
+    if (!metrics) { std::cerr << "Cannot write run-metrics.json" << std::endl; return -1; }
     std::cout << "All done!" << std::endl;
 
     return 0;

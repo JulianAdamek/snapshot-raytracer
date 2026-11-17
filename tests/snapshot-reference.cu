@@ -10,6 +10,10 @@ void snapshot_pack_b(const float* values, std::uint16_t* packed, std::size_t cou
         packed[i] = h.x;
     }
 }
+float snapshot_reference_sample(const float* potential,int n,double x,double y,double z,float* grad,float hessian[3][3]) {
+    const int dims[3]={n,n,n};
+    return tricubic_interpolation(potential,dims,x,y,z,grad,hessian);
+}
 namespace {
 std::vector<__half> half_vectors(const float* data, int n) {
     const std::size_t size = 3ULL*n*n*n;
@@ -36,10 +40,11 @@ void snapshot_reference_step(const float* potential, const float* vectors, int n
 }
 bool snapshot_reference_trace(const float* potential, const float* vectors, int n, double* state,
                               double target_z, int max_steps, double cell_size_mpc, double h0,
-                              double omega_m, double omega_lambda, double* reached_z) {
+                              double omega_m, double omega_lambda, double* reached_z, double tolerance) {
     auto b = half_vectors(vectors, n);
     const std::size_t size = static_cast<std::size_t>(n)*n*n;
     const int dims[3] = {n, n, n};
     RayIntegrationConfig config{target_z, cell_size_mpc, h0/SPEED_OF_LIGHT_KM_PER_S, omega_m, omega_lambda, max_steps};
+    config.redshift_tolerance=tolerance;
     return raytracing(potential, b.data(), b.data()+size, b.data()+2*size, dims, config, state, reached_z);
 }

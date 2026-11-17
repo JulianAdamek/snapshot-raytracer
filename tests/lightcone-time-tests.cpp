@@ -126,7 +126,7 @@ void homogeneous_tests() {
     for(int i=0;i<16;++i)check(rk4_step(v,y,0.5)==Status::Ok,"Homogeneous RK4");
     near(y[STATE_ISW],16*alpha,2e-12,"ISW equals 2 alpha lookback");
     near(y[STATE_LOG_KTILDE0]-initial_energy,y[STATE_ISW],2e-12,"ISW and photon-energy contributions agree");
-    near(y[STATE_DA],-std::expm1(-16*alpha)/(2*alpha),2e-10,"Scalar time damping of distance");
+    near(y[STATE_DA],std::exp(2*alpha*f.n)*-std::expm1(-16*alpha)/(2*alpha),2e-10,"Scalar time damping with observer normalization");
     check(observed_redshift(v,y,z)==Status::Ok,"Homogeneous redshift");
     double a;check(background_at(v,y[STATE_TAU],a)==Status::Ok,"Source background");
     near(std::log1p(z),std::log(0.8/a)+alpha*f.n*(y[STATE_TAU]-1),2e-12,"Analytic homogeneous lapse redshift");
@@ -147,6 +147,11 @@ void homogeneous_tests() {
     }
     std::cout << "ISW slope-knot integration errors: " << errors[0] << " -> " << errors[1] << '\n';
     check(errors[1]<errors[0]/10,"ISW converges across derivative discontinuities");
+    const float constant=std::ldexp(1.f,-10);
+    f.fill([&](int field,double,double,double,double){return field ? 0.f:constant;});
+    check(initialize(v,1.,1.2,.3,y)==Status::Ok,"Constant-potential observer");
+    for(int i=0;i<8;++i)check(rk4_step(v,y,.5)==Status::Ok,"Constant-potential straight ray");
+    near(y[STATE_DA],4*std::exp(2.*constant),2e-12,"Constant potential obeys the exact distance normalization");
 }
 }
 int main(){try{sampling_tests();rhs_tests();homogeneous_tests();std::cout<<"Time-derivative/ISW CPU checks passed ("<<checks<<").\n";return 0;}catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}}

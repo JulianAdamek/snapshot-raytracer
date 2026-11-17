@@ -74,6 +74,16 @@ Thickness 1 uses filenames `lc_phi.h5`, `lc_B1.h5`, etc., and requires explicit
 while retaining the available field-value sampling. Default finite differences
 require at least two recorded time samples at every required stencil node.
 
+Zero mode is a frozen-field/snapshot approximation, not a physical "no ISW"
+option for evolving data: time interpolation of field values remains active.
+It is available for every thickness for controlled comparisons, with a warning.
+
+Both tracers now use the complete scalar factors and observer distance
+normalization, and include the antisymmetric B term in screen transport.
+The [ODE controls guide](ode-controls.md) documents the independent compile-time
+switches for historical error measurements. `--redshift-tol` sets the absolute
+endpoint tolerance (default `1e-8`); failure to reach it invalidates the ray.
+
 ## Shell geometry conventions
 
 For new gasgrd cubes, supply the writer's additional binary geometry sidecar:
@@ -181,7 +191,8 @@ ISW has the positive source-to-observer temperature convention and excludes
 endpoint gravitational-redshift and Doppler terms. Frozen fields give exactly
 zero ISW. Failed rays have NaN optical/ISW outputs and retain the last available
 redshift in `zmap`. `run-metrics.json` records storage sizes, requested source
-bytes, timings, derivative mode, scalar source, shell geometry convention and
+bytes, timings, derivative mode, scalar source, shell geometry convention, ODE
+correction switches, endpoint tolerance and
 residency misses.
 
 `make test` runs the CPU suites, including analytic shear transport tests and
@@ -189,7 +200,7 @@ comparisons against the snapshot source; CUDA compilation is needed but these
 tests launch no GPU kernels. `make test-gpu` separately verifies host/device
 radius bits, angular decisions and shell ownership for both geometry modes.
 Frozen-field GH200 job 5277317 passed after the static shear-sign correction;
-GPU validation of the geometry changes remains pending. Historical maps from
+GPU validation of the geometry and subsequent ODE changes remains pending. Historical maps from
 the previous sign are not unchanged-output references. Genuinely evolving simulation light cones still
 need validation. See [the validation guide](../validation/README.md) for the Alps
 job and [the reference notes](../README.md#static-shear-transport-correction)

@@ -15,6 +15,7 @@ make -j4 ARCH=grace_hopper CXX=mpicxx "NVCC=nvcc -ccbin $(command -v g++)" \
     "INCLUDES=-I$LC_LOCAL_PREFIX/include" "LIBS=-L$LC_LOCAL_PREFIX/lib -lcfitsio" \
     snapshot-raytracer lightcone-raytracer validation/validation-tools \
     tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-reference-tests \
-    tests/lightcone-geometry-tests tests/lightcone-geometry-gpu
+    tests/lightcone-geometry-tests tests/lightcone-geometry-gpu tests/lightcone-bundle-tests \
+    .build/variant-00 .build/variant-01 .build/variant-10 .build/variant-11 .build/variant-0000
 file snapshot-raytracer lightcone-raytracer validation/validation-tools
 printf 'Build complete. Tests have not run. Submit validation/alps-isw.sbatch for time-derivative validation.\n'

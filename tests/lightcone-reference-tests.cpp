@@ -58,9 +58,8 @@ void static_shear_transport() {
             copy_state(snapshot, state); snapshot[20] = 0;
             check(ode(view, state, rhs) == Status::Ok, "Shear transport RHS");
             snapshot_reference_ode(f.fields[0].data(), vectors.data(), f.n, snapshot, snapshot_rhs, cell, h0, om, ol);
-            // Scalar F uses the existing weak-field spatial prefactor approximation.
-            // In the pure vector case F = d(log ktilde0)/ds = beta exactly.
-            const double transport = vector ? beta : -4*alpha;
+            // In the pure vector case F = beta; scalar transport retains exp(2W).
+            const double transport = vector ? beta : -4*alpha*std::exp(32*alpha);
             for (int component : {STATE_SIGMA1, STATE_SIGMA2}) {
                 const double expected = -transport*state[component];
                 near(rhs[component], expected, 1e-16, "Light-cone shear has Jacobi transport sign");
@@ -146,7 +145,7 @@ void snapshot_reduction() {
 void background_convergence() {
     Fixture f(16, 1);
     for (auto& field : f.fields) std::fill(field.begin(), field.end(), 0.0f);
-    double previous_error = 1, coarse_error = 0;
+    double previous_error = 1, coarse_error = 0, previous_distance=1;
     for (double spacing : {0.5, 0.25, 0.125, 0.0625}) {
         set_background(f, spacing);
         auto v = f.view();
@@ -168,16 +167,35 @@ void background_convergence() {
         std::vector<float> vectors(3ULL*f.n*f.n*f.n, 0.0f);
         check(snapshot_reference_trace(f.fields[0].data(), vectors.data(), f.n, reference,
                                       0.1, 30, cell, h0, om, ol, &reference_z), "Convergence snapshot endpoint");
-        near(y[STATE_DA], reference[STATE_DA], 0.015, "Converged endpoint maps within redshift stopping uncertainty");
+        const double distance_error=std::fabs(y[STATE_DA]-reference[STATE_DA]);
+        check(distance_error<previous_distance,"Endpoint distance converges with background table");
+        previous_distance=distance_error;
         std::cout << "LCDM spacing " << spacing << ": background error=" << error
                   << ", endpoint distance difference=" << std::fabs(y[STATE_DA]-reference[STATE_DA]) << '\n';
     }
     check(previous_error < coarse_error/100, "Background error decreases by more than 100x");
+    check(previous_distance<1e-5,"Fine background agrees at tighter endpoint precision");
+}
+void snapshot_endpoint_failure() {
+    Fixture f(16,1);set_background(f,.125);
+    for(auto& field:f.fields)std::fill(field.begin(),field.end(),0.f);
+    std::vector<float> vectors(3ULL*f.n*f.n*f.n,0.f);
+    double state[STATE_SIZE],z;
+    check(initialize(f.view(),1.,1.2,.3,state)==Status::Ok,"Snapshot tolerance observer");state[20]=0.;
+    check(!snapshot_reference_trace(f.fields[0].data(),vectors.data(),f.n,state,.03141592653589793,100,
+                                   cell,h0,om,ol,&z,1e-30),"Snapshot cannot silently accept exhausted refinement");
+    check(initialize(f.view(),1.,1.2,.3,state)==Status::Ok,"Snapshot legacy tolerance observer");state[20]=0.;
+    check(snapshot_reference_trace(f.fields[0].data(),vectors.data(),f.n,state,.03,100,cell,h0,om,ol,&z,1e-4),"Snapshot runtime tolerance override");
+    check(z>=.03 && z-.03<=1e-4,"Snapshot override residual");
+    check(initialize(f.view(),1.,1.2,.3,state)==Status::Ok,"Snapshot overshot state");state[20]=0.;
+    state[STATE_LOG_KTILDE0]+=std::log1p(.1);
+    check(!snapshot_reference_trace(f.fields[0].data(),vectors.data(),f.n,state,.03,100,
+                                   cell,h0,om,ol,&z),"Snapshot initial overshoot must satisfy tolerance");
 }
 }
 int main() {
     try {
-        static_shear_transport(); snapshot_reduction(); background_convergence();
+        static_shear_transport(); snapshot_reduction(); background_convergence(); snapshot_endpoint_failure();
         std::cout << "Snapshot reference checks passed (" << checks << "). No GPU calls made.\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }

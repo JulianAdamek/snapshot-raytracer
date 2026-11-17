@@ -66,6 +66,13 @@ Map meanings:
 
 ## Light-cone raytracer
 
+The [ODE controls guide](docs/ode-controls.md) describes the corrected scalar and
+Sachs equations and the compile-time switches for independently measuring the
+historical shear-sign and antisymmetric-B omissions in both executables.
+Both now default to a `1e-8` absolute redshift tolerance; use `--redshift-tol`
+to change it. Each executable records its ODE switches and tolerance in
+`run-metrics.json` as well as its log.
+
 See the [short user guide](docs/lightcone-raytracer.md) for build and run examples, inputs,
 face batching, slab storage and output conventions. The details below describe the implementation.
 
@@ -183,8 +190,9 @@ For backward cell time `s`, define `F = d log(ktilde0)/ds`. The Jacobi equation
 `J_ss + F J_s = T J` implies `H_s = -F H + D^2 T_TF` for the weighted trace-free
 deformation `H = D^2 (J_s J^-1)_TF`. Thus the coefficient multiplying either
 stored shear component is negative. Both scalar-gradient and vector-gradient
-contributions have been corrected; their existing spatial prefactors, tidal
-sources and ellipticity conventions are preserved. Light-cone time derivatives
+contributions have been corrected. Scalar prefactors now retain the nonlinear
+exponentials and gradient products; leading-vector order and ellipticity
+conventions are preserved. Light-cone time derivatives
 already use the same negative transport sign.
 
 The image-ellipticity convention is independent of this correction: changing an
@@ -199,4 +207,6 @@ checks full/slab, finite-difference/zero and FITS ordering consistency. It also
 checks each implementation independently using seeded optical shear, zero
 anisotropic tidal forcing and conservation of `ktilde0 * sigma` in a constant
 vector-transport fixture. Explicit saved baselines must carry the manifest tag
-`static_shear_transport: negative`.
+`static_shear_transport: negative` and matching `physics` and `redshift_tolerance`
+settings. The [historical ODE controls](docs/ode-controls.md) permit deliberate
+reintroduction of either transport error for controlled measurements.

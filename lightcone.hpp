@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lccube_geometry.h" // Vendored gasgrd convention 1; no external checkout required.
+#include "raytracer_physics.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -151,6 +152,7 @@ struct View {
     double trace_tau_min = -1.7976931348623157e308;
     MissDiagnostic* miss = nullptr; // thread-local diagnostic; never shared between rays
     TimeDerivativeMode time_derivatives = TimeDerivativeMode::FiniteDifference;
+    double redshift_tolerance = raytracer::DEFAULT_REDSHIFT_TOL;
 };
 View host_view(const Metadata& metadata, int n, const Geometry& geometry,
                const GridView* grids);

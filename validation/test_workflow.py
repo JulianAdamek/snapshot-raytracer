@@ -63,6 +63,7 @@ class WorkflowTests(unittest.TestCase):
                  (['--padding-cells','0'],'Slab-specific options'),
                  (['--batch','0','--storage','ziggurat','--padding-cells','-1'],'Invalid slab thickness or padding'),
                  (['--max-lookback-cells','0'],'Look-back cap must be positive'),
+                 (['--redshift-tol','0'],'Redshift tolerance must be positive'),
                  (['--ordering','unknown'],'Ordering must be nested or ring'),
                  (['--time-derivatives','invalid'],'Time derivatives must be finite-difference or zero')]
         for args, message in cases:
@@ -75,6 +76,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('Thickness 1 requires explicit',result.stderr)
         result = subprocess.run(command+['--time-derivatives','zero'],capture_output=True,text=True)
         self.assertIn('Cannot open info file',result.stderr)
+        self.assertIn('not a physical no-ISW calculation',result.stderr)
         command = base.copy(); command[2] = '3'
         result = subprocess.run(command,capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
@@ -168,7 +170,9 @@ class WorkflowTests(unittest.TestCase):
                     ordering = options[options.index('--ordering')+1].upper()
                     orderings[str(cwd)] = ordering
                     run_static.write_json(Path(cwd)/'run-metrics.json', {'storage':storage,'residency_misses':0,'time_derivatives':options[options.index('--time-derivatives')+1],
-                        'static_shear_transport':'negative', 'shell_geometry':'legacy'})
+                        'static_shear_transport':'negative', 'shell_geometry':'legacy','physics':run_static.EXPECTED_PHYSICS,'redshift_tolerance':1e-8})
+                if Path(command[0]).name == 'snapshot-raytracer':
+                    run_static.write_json(Path(cwd)/'run-metrics.json',{'physics':run_static.EXPECTED_PHYSICS,'redshift_tolerance':1e-8})
                 return {'wall_seconds':0,'max_host_rss_kib':0}
 
             def compare(command, cwd):
@@ -184,7 +188,7 @@ class WorkflowTests(unittest.TestCase):
             baseline = root/'baseline'; old_full = baseline/'references/z0.15/lightcone'
             old_full.mkdir(parents=True); (old_full/'zmap_batch0.fits').touch()
             run_static.write_json(baseline/'manifest.json',{'nside':16,'snapshot_index':0,'static_shear_transport':'negative',
-                'configuration':cosmology(run_static.settings_file(settings)),'targets':[0.15]})
+                'physics':run_static.EXPECTED_PHYSICS,'redshift_tolerance':1e-8,'configuration':cosmology(run_static.settings_file(settings)),'targets':[0.15]})
             args = ['run_static.py','--allow-local','--validate-isw','--data-dir',str(root),
                     '--settings',str(settings),'--snapshot','0','--output-root',str(root/'results')]
             if use_baseline:
@@ -206,6 +210,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len([c for c in commands if len(c)>1 and c[1]=='compare-frozen']),2 if use_baseline else 0)
             if use_baseline:
                 saved = json.loads((baseline/'manifest.json').read_text())
+                original = json.loads(json.dumps(saved))
+                saved['physics']['correct_sachs_b'] = 0
+                run_static.write_json(baseline/'manifest.json',saved)
+                with patch('sys.argv',args), patch.object(run_static,'run_logged') as execute_mock, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit): run_static.main()
+                    execute_mock.assert_not_called()
+                saved = original
                 del saved['static_shear_transport']
                 run_static.write_json(baseline/'manifest.json',saved)
                 with patch('sys.argv',args), patch.object(run_static,'run_logged') as execute_mock, contextlib.redirect_stderr(io.StringIO()):

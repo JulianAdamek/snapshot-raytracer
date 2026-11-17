@@ -47,6 +47,7 @@ struct Options {
     std::int64_t nside = 0;
     int thickness = 0, batch = -1;
     double observer_tau = NAN, target_z = NAN;
+    double redshift_tolerance = raytracer::DEFAULT_REDSHIFT_TOL;
     lightcone::Geometry geometry;
     bool staggered = true, ziggurat = false;
     lightcone::Ordering ordering = lightcone::Ordering::Nested;
@@ -62,7 +63,7 @@ const char* usage =
     "  [--radial-range <rmin/L> <rmax/L>] [--ordering nested|ring]\n"
     "  [--storage full|ziggurat] [--slab-cells <N>] [--padding-cells <N>]\n"
     "  [--max-lookback-cells <S>] [--time-derivatives finite-difference|zero]\n"
-    "  [--scalar phi|weyl|phi-chi]\n"
+    "  [--scalar phi|weyl|phi-chi] [--redshift-tol <positive tolerance, default 1e-8>]\n"
     "With --geometry, vertex, direction, opening, radial range, thickness, B layout and\n"
     "the default observer time come from the binary file. Otherwise legacy geometry is used.\n";
 Options parse(int argc, char** argv) {
@@ -109,6 +110,10 @@ Options parse(int argc, char** argv) {
             scalar_set = true;
         }
         else if (arg == "--target-z") o.target_z = number(next());
+        else if (arg == "--redshift-tol") {
+            o.redshift_tolerance = number(next());
+            if (o.redshift_tolerance <= 0.0) throw std::runtime_error("Redshift tolerance must be positive");
+        }
         else if (arg == "--time-derivatives") {
             const auto mode = next();
             if (mode != "finite-difference" && mode != "zero")
@@ -233,6 +238,10 @@ using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now()-start).count(); }
 
 int run(const Options& o) {
+    std::cout << "ODE corrections: " << raytracer::PHYSICS_JSON << "; redshift tolerance: " << o.redshift_tolerance << '\n';
+    if (o.time_derivatives == lightcone::TimeDerivativeMode::Zero)
+        std::cerr << "Warning: zero time derivatives are a frozen-field/snapshot approximation. Field values still use time samples; "
+                     "on evolving data this is not a physical no-ISW calculation.\n";
     std::cout << "Shell geometry: " << lightcone::geometry_convention_name(o.geometry.convention) << '\n';
     if (o.geometry_file.empty())
         std::cerr << "Warning: no geometry sidecar supplied; using the legacy writer's wrapped-position/shifted-vertex convention "
@@ -334,6 +343,7 @@ int run(const Options& o) {
     view.layout = layout.view(); view.layout.slabs = descriptors.data;
     view.trace_tau_min = lower_tau;
     view.time_derivatives = o.time_derivatives;
+    view.redshift_tolerance = o.redshift_tolerance;
     DeviceBuffer<double> device_theta(theta), device_phi(phi);
     DeviceBuffer<float> maps(lightcone::checked_multiply(count, lightcone::MAP_COUNT));
     DeviceBuffer<int> device_status(count), first_miss(1);
@@ -361,7 +371,7 @@ int run(const Options& o) {
     std::ofstream metrics("run-metrics.json");
     if (!metrics) throw std::runtime_error("Cannot write run-metrics.json");
     metrics << std::setprecision(17) << "{\"storage\":\"" << (o.ziggurat ? "ziggurat" : "full")
-            << "\",\"static_shear_transport\":\"negative"
+            << "\",\"static_shear_transport\":\"" << raytracer::SHEAR_TRANSPORT_NAME
             << "\",\"time_derivatives\":\"" << lightcone::time_derivative_name(o.time_derivatives)
             << "\",\"shell_geometry\":\"" << lightcone::geometry_convention_name(o.geometry.convention)
             << "\",\"scalar_source\":\"" << lightcone::scalar_source_name(o.scalar)
@@ -371,6 +381,7 @@ int run(const Options& o) {
             << ",\"device_bytes\":" << estimate.device_bytes << ",\"field_staging_bytes\":" << estimate.field_staging_bytes
             << ",\"source_payload_bytes\":" << reader.bytes_read() << ",\"geometry_seconds\":" << geometry_seconds
             << ",\"loading_seconds\":" << loading_seconds << ",\"tracing_seconds\":" << tracing_seconds
+            << ",\"physics\":" << raytracer::PHYSICS_JSON << ",\"redshift_tolerance\":" << o.redshift_tolerance
             << ",\"effective_lookback_cells\":" << effective_lookback << ",\"residency_misses\":"
             << totals[static_cast<int>(lightcone::Status::NotResident)] << "}\n";
     metrics.close();
