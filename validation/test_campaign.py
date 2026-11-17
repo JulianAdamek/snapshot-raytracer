@@ -44,6 +44,8 @@ class CampaignTests(unittest.TestCase):
         for key,value in [('redshift_tolerance',1e-4),('target_z',.3),('info_sha256','b'*64)]:
             other={**m,key:value};self.assertNotEqual(c.science_id(m,'corrected',16),c.science_id(other,'corrected',16))
         self.assertNotEqual(c.science_id(m,'corrected',16),c.science_id(m,'legacy',16))
+        prepared={**m,'prepared_inputs':[{'logical':'lc_B1.h5','identity':{'path':'B1.h5','bytes':1,'mtime_ns':1}}]}
+        self.assertNotEqual(c.science_id(m,'corrected',16),c.science_id(prepared,'corrected',16))
 
     def test_parent_reuse_and_exact_coverage(self):
         m=manifest();cfg={'level':1,'probe_nside':8,'io_mode':'auto'}

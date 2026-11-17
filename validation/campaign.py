@@ -43,7 +43,8 @@ def science_id(manifest, variant, nside):
     # Storage, subdivision and executable identity do not change the science.
     settings={k:manifest[k] for k in ('configuration','inputs','snapshot_z','target_z','ordering',
         'time_derivatives','scalar_source','b_layout','shell_geometry','redshift_tolerance','synthetic')}
-    settings.update(nside=nside,physics=manifest['variants'][variant],info_sha256=manifest['info_sha256'])
+    settings.update(nside=nside,physics=manifest['variants'][variant],info_sha256=manifest['info_sha256'],
+                    prepared_inputs=manifest.get('prepared_inputs',[]))
     return hashlib.sha256(json.dumps(settings,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
@@ -56,6 +57,9 @@ def init(args):
     if shutil.disk_usage(root).free<needed: raise RuntimeError(f'Need {needed} free bytes for compact intermediates and final maps')
     (root/'bin').mkdir()
     binaries={}
+    if manifest['synthetic']['thickness']!=1: raise RuntimeError('This frozen campaign requires the prepared thickness-1 fixture')
+    prepared_inputs=[{'logical':str(original/'fixture'/name),'identity':old.identity(original/'fixture'/name)}
+                     for name in ('lc_phi.h5','lc_B1.h5','lc_B2.h5','lc_B3.h5')]
     sources={name:ROOT/'validation/bin'/name for name in ('lightcone-corrected','lightcone-legacy','validation-tools')}
     for name in ('lightcone-tests','lightcone-storage-tests','lightcone-time-tests','lightcone-reference-tests',
                  'lightcone-geometry-tests','lightcone-geometry-gpu','lightcone-bundle-tests','lightcone-preload-tests',
@@ -68,7 +72,7 @@ def init(args):
     (root/'tables').mkdir()
     config={'schema':1,'created_utc':stamp(),'original':str(original),
             'workflow_revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'manifest_sha256':old.sha256(original/'manifest.json'),
-            'level':args.level,'io_mode':'auto','io_buffer_mib':256,'binary_sha256':binaries,
+            'prepared_inputs':prepared_inputs,'level':args.level,'io_mode':'auto','io_buffer_mib':256,'binary_sha256':binaries,
             'python_sha256':{name:old.sha256(ROOT/'validation'/name) for name in ('campaign.py','ode_comparison.py','run_static.py')},
             'probe_nside':1024,'final_ordering':'NESTED'}
     atomic(root/'campaign.json',config)
@@ -80,6 +84,9 @@ def load(root):
     if old.sha256(original/'manifest.json')!=config['manifest_sha256']:
         raise RuntimeError('Original prepared manifest changed')
     manifest=old.load(original)
+    for item in config['prepared_inputs']:
+        if old.identity(item['logical'])!=item['identity']: raise RuntimeError('Prepared component changed: '+item['logical'])
+    manifest['prepared_inputs']=config['prepared_inputs']
     for name,digest in config['binary_sha256'].items():
         if old.sha256(root/'bin'/name)!=digest: raise RuntimeError('Campaign binary changed: '+name)
     for name,digest in config['python_sha256'].items():
@@ -322,6 +329,7 @@ def run(args):
         artifacts=[artifact(part),artifact(attempt/'run-metrics.json')]
         result={'pass':True,'task':t,'part_file':str(part),'artifacts':artifacts,'metrics':metrics,'resources':resources,
                 'binary_sha256':config['binary_sha256']['lightcone-'+t['variant']], 'checking_seconds':time.monotonic()-checking}
+        load(root) # Recheck inputs after the long preload/trace before publishing success.
         atomic(success,result);print('Completed:',phase,task_key(t),flush=True)
 
 
