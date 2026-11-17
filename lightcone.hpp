@@ -93,6 +93,8 @@ public:
     std::vector<float> read_region(int field, int slot,
                                   const std::int64_t origin[3], const int extent[3]) const;
     std::uint64_t bytes_read() const;
+    std::uint64_t read_calls() const;
+    double read_seconds() const;
 private:
     std::vector<float> read_file_region(int file, int slot,
                                         const std::int64_t origin[3], const int extent[3]) const;

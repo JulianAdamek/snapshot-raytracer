@@ -17,6 +17,7 @@ cp lightcone-raytracer validation/bin/lightcone-legacy
 make -j4 "${LC_BUILD_ARGS[@]}" CORRECT_SHEAR_TRANSPORT=1 CORRECT_SACHS_B=1 \
     NONLINEAR_SCALAR=1 CORRECT_OBSERVER_DISTANCE=1 lightcone-raytracer snapshot-raytracer \
     validation/validation-tools tests/lightcone-geometry-gpu tests/lightcone-tests \
+    tests/lightcone-preload-tests tests/lightcone-preload-gpu tests/lightcone-preload-gpu-legacy \
     tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-reference-tests \
     tests/lightcone-geometry-tests tests/lightcone-bundle-tests \
     .build/variant-0000 .build/variant-00 .build/variant-01 .build/variant-10 .build/variant-11

@@ -1,5 +1,11 @@
 # Frozen-snapshot ODE comparison on Alps
 
+**Continuation after pilot 5374827:** use the [tiled, subdivided campaign](tiled-campaign-alps.md).
+It preserves this fixture and successful pilot faces, fixes fragmented x-slab
+reads, and replaces the original whole-face production workflow. The commands
+below document the original campaign; do not restart its pilot over existing
+face directories or submit its whole-face production job.
+
 This exercise measures the combined effect of **all four ODE corrections** at
 source redshift 0.5, using the same frozen z=0.25 fields for both runs. It produces
 maps for subsequent analysis; it does not yet implement the published B-mode

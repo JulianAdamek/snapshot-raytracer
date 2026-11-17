@@ -1,5 +1,10 @@
 # GPU validation on Alps
 
+For continuation of the timed-out 2400³ pilot, use the
+[tiled and resumable campaign](../docs/tiled-campaign-alps.md). It uses compact
+NESTED regions and assembles full-sky maps, while preserving the existing fixture
+and successful pilot outputs.
+
 For the 2400³ frozen z=0.25 snapshot, Nside 16384/source z=0.5 comparison
 of all four ODE corrections on/off, use the separate
 [high-resolution ODE workflow](../docs/ode-comparison-alps.md).

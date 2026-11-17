@@ -49,8 +49,8 @@ lightcone-raytracer tests/lightcone-tests tests/lightcone-storage-tests tests/li
 $(TARGET): $(SRC)
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ $< $(HDF5_LIBS) -lchealpix $(LIBS)
 
-lightcone-raytracer: lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp lightcone-raytracer.cu lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
-	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ lightcone-raytracer.cu lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
+lightcone-raytracer: lightcone_preload.hpp lightcone_preload.cpp lightcone_parts.hpp lightcone_parts.cpp lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp lightcone-raytracer.cu lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) -Xcompiler -pthread $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -o $@ lightcone-raytracer.cu lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone_preload.cpp lightcone_parts.cpp $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
 
 tests/lightcone-tests: tests/lightcone-tests.cpp lightcone_layout.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
 	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-tests.cpp lightcone.cpp lightcone_layout.cpp $(HDF5_LIBS) $(LIBS)
@@ -61,8 +61,8 @@ tests/snapshot-reference.o: tests/snapshot-reference.cu tests/snapshot-reference
 tests/lightcone-reference-tests: lightcone_layout.cpp tests/lightcone-reference-tests.cpp tests/snapshot-reference.o lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(OMP_FLAGS) $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-reference-tests.cpp lightcone.cpp lightcone_layout.cpp tests/snapshot-reference.o $(HDF5_LIBS) -lchealpix $(LIBS)
 
-validation/validation-tools: lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp validation/validation-tools.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
-	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ validation/validation-tools.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
+validation/validation-tools: lightcone_parts.hpp lightcone_parts.cpp lightcone_maps.hpp lightcone_maps.cpp lightcone_layout.cpp validation/validation-tools.cpp lightcone.cpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp
+	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ validation/validation-tools.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone_parts.cpp $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
 
 tests/lightcone-storage-tests: tests/lightcone-storage-tests.cpp tests/test_support.hpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone.hpp lightcone_maps.hpp lightcone_sampling.hpp lightcone_ray.hpp
 	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -Wall -Wextra -Wno-unknown-pragmas -fopenmp -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-storage-tests.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix $(LIBS)
@@ -76,7 +76,7 @@ tests/lightcone-geometry-tests: tests/lightcone-geometry-tests.cpp tests/test_su
 tests/lightcone-geometry-gpu: tests/lightcone-geometry-gpu.cu lightcone.hpp lightcone_sampling.hpp $(LC_GEOMETRY_HEADERS)
 	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(PHYSICS_FLAGS) $(CPPFLAGS) $(INCLUDES) -I. -o $@ $<
 
-test-gpu: tests/lightcone-geometry-gpu
+test-gpu-geometry: tests/lightcone-geometry-gpu
 	./tests/lightcone-geometry-gpu
 
 test-cpu: tests/lightcone-tests tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-geometry-tests
@@ -115,11 +115,37 @@ test-bundle: tests/lightcone-bundle-tests
 test-validation: lightcone-raytracer validation/validation-tools
 	python3 validation/test_workflow.py
 	python3 validation/test_ode_comparison.py
+	python3 validation/test_campaign.py
 
 test: test-cpu test-reference test-validation test-bundle test-variants
 
 clean:
 	rm -f $(TARGET) lightcone-raytracer tests/lightcone-tests tests/lightcone-reference-tests tests/snapshot-reference.o tests/lightcone-storage-tests tests/lightcone-time-tests tests/lightcone-geometry-tests tests/lightcone-geometry-gpu tests/lightcone-bundle-tests validation/validation-tools
+	rm -f tests/lightcone-preload-tests tests/lightcone-preload-gpu tests/lightcone-preload-gpu-legacy
 	rm -rf .build
 
 .PHONY: all clean test test-cpu test-gpu test-reference test-validation test-bundle test-variants
+
+tests/lightcone-preload-tests: tests/lightcone-preload-tests.cpp tests/test_support.hpp lightcone_preload.cpp lightcone_preload.hpp lightcone_parts.cpp lightcone_parts.hpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone_maps.hpp lightcone.hpp $(LC_GEOMETRY_HEADERS) raytracer_physics.hpp .build/physics-config
+	$(CXX) $(PHYSICS_FLAGS) $(CPPFLAGS) -O2 -Wall -Wextra -Wno-unknown-pragmas -std=$(CXXSTD) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ tests/lightcone-preload-tests.cpp lightcone_preload.cpp lightcone_parts.cpp lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
+
+test-preload: tests/lightcone-preload-tests
+	./tests/lightcone-preload-tests
+
+test: test-preload
+.PHONY: test-preload
+
+LC_PRELOAD_SOURCES = lightcone.cpp lightcone_layout.cpp lightcone_maps.cpp lightcone_preload.cpp lightcone_parts.cpp
+LC_PRELOAD_HEADERS = lightcone_preload.hpp lightcone_parts.hpp lightcone_maps.hpp lightcone.hpp lightcone_sampling.hpp lightcone_ray.hpp $(LC_GEOMETRY_HEADERS) raytracer_physics.hpp
+
+tests/lightcone-preload-gpu: tests/lightcone-preload-gpu.cu tests/test_support.hpp lightcone-raytracer.cu $(LC_PRELOAD_SOURCES) $(LC_PRELOAD_HEADERS) .build/physics-config
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) -Xcompiler -pthread $(PHYSICS_FLAGS) $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ $< $(LC_PRELOAD_SOURCES) $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
+
+tests/lightcone-preload-gpu-legacy: tests/lightcone-preload-gpu.cu tests/test_support.hpp lightcone-raytracer.cu $(LC_PRELOAD_SOURCES) $(LC_PRELOAD_HEADERS)
+	$(NVCC) $(OPT_FLAGS) -std=$(CXXSTD) $(GENCODE) $(OMP_FLAGS) -Xcompiler -pthread -DRT_CORRECT_SHEAR_TRANSPORT=0 -DRT_CORRECT_SACHS_B=0 -DRT_NONLINEAR_SCALAR=0 -DRT_CORRECT_OBSERVER_DISTANCE=0 $(CPPFLAGS) $(HDF5_CFLAGS) $(INCLUDES) -I. -o $@ $< $(LC_PRELOAD_SOURCES) $(HDF5_LIBS) -lchealpix -lcfitsio $(LIBS)
+
+test-gpu: test-gpu-geometry tests/lightcone-preload-gpu tests/lightcone-preload-gpu-legacy
+	./tests/lightcone-preload-gpu
+	./tests/lightcone-preload-gpu-legacy
+
+.PHONY: test-gpu-geometry

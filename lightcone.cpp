@@ -1,4 +1,5 @@
 #include "lightcone.hpp"
+#include <chrono>
 
 #include <algorithm>
 #include <cmath>
@@ -229,9 +230,13 @@ struct Reader::Impl {
     };
     Handle handles[2];
     std::uint64_t bytes = 0;
+    std::uint64_t calls = 0;
+    double seconds = 0;
 };
 Reader::~Reader() = default;
 std::uint64_t Reader::bytes_read() const { return impl_->bytes; }
+std::uint64_t Reader::read_calls() const { return impl_->calls; }
+double Reader::read_seconds() const { return impl_->seconds; }
 Reader::Reader(std::string base, int thickness, ScalarSource scalar)
     : impl_(std::make_unique<Impl>()), base_(std::move(base)), thickness_(thickness), scalar_(scalar) {
     require(thickness > 0, "--thickness must be positive");
@@ -301,6 +306,7 @@ std::vector<float> Reader::read_file_region(int field, int slot, const std::int6
         }
     }
     for (const auto& z : spans[2]) for (const auto& y : spans[1]) for (const auto& x : spans[0]) {
+        const auto started = std::chrono::steady_clock::now();
         const hsize_t start[3] = {z.file, y.file, x.file};
         const hsize_t output[3] = {z.memory, y.memory, x.memory};
         const hsize_t count[3] = {z.length, y.length, x.length};
@@ -309,6 +315,8 @@ std::vector<float> Reader::read_file_region(int field, int slot, const std::int6
                 "Cannot select HDF5 subarray");
         require(H5Dread(h.data, H5T_NATIVE_FLOAT, memory_space.id, h.space, H5P_DEFAULT, result.data()) >= 0,
                 "Cannot read HDF5 subarray");
+        ++impl_->calls;
+        impl_->seconds += std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
     }
     const auto bytes = checked_multiply(result.size(), h.source_bytes);
     impl_->bytes = checked_add(impl_->bytes, bytes);

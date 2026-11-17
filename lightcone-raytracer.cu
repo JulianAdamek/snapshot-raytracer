@@ -1,6 +1,8 @@
 // Light-cone fork of snapshot-raytracer: the optical equations live in lightcone_ray.hpp.
 #include "lightcone_ray.hpp"
 #include "lightcone_maps.hpp"
+#include "lightcone_preload.hpp"
+#include "lightcone_parts.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <chealpix.h>
@@ -17,6 +19,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <sstream>
+#include <atomic>
+#include <thread>
+#include <condition_variable>
+#include <mutex>
 
 namespace {
 void cuda_check(cudaError_t error) {
@@ -54,6 +62,11 @@ struct Options {
     int slab_cells = 16, padding_cells = 8;
     double max_lookback = INFINITY;
     lightcone::TimeDerivativeMode time_derivatives = lightcone::TimeDerivativeMode::FiniteDifference;
+    std::string io_mode="auto", run_id;
+    std::size_t io_budget=256ULL*1024*1024;
+    int subdivision_level=0;
+    std::int64_t part=0;
+    bool compact=false;
 };
 const char* usage =
     "Usage: lightcone-raytracer <lightcone-base> <Nside> --info <info.bin> --target-z <z>\n"
@@ -64,6 +77,8 @@ const char* usage =
     "  [--storage full|ziggurat] [--slab-cells <N>] [--padding-cells <N>]\n"
     "  [--max-lookback-cells <S>] [--time-derivatives finite-difference|zero]\n"
     "  [--scalar phi|weyl|phi-chi] [--redshift-tol <positive tolerance, default 1e-8>]\n"
+    "  [--io-mode auto|regions|tiles] [--io-buffer-mib <N, default 256>]\n"
+    "  [--subdivision-level <L> --part <P>] [--output-format fits|compact-hdf5] [--run-id <SHA256>]\n"
     "With --geometry, vertex, direction, opening, radial range, thickness, B layout and\n"
     "the default observer time come from the binary file. Otherwise legacy geometry is used.\n";
 Options parse(int argc, char** argv) {
@@ -93,6 +108,25 @@ Options parse(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--info") o.info = next();
+        else if (arg == "--io-mode") {
+            o.io_mode=next();
+            if(o.io_mode!="auto" && o.io_mode!="regions" && o.io_mode!="tiles") throw std::runtime_error("I/O mode must be auto, regions or tiles");
+        }
+        else if (arg == "--io-buffer-mib") {
+            const auto value=integer(next());
+            if(value<=0 || static_cast<std::uint64_t>(value)>std::numeric_limits<std::size_t>::max()/(1024*1024)) throw std::runtime_error("Invalid I/O buffer budget");
+            o.io_budget=static_cast<std::size_t>(value)*1024*1024;
+        }
+        else if (arg == "--subdivision-level") {
+            const auto value=integer(next()); if(value<0 || value>29) throw std::runtime_error("Invalid subdivision level");
+            o.subdivision_level=static_cast<int>(value);
+        }
+        else if (arg == "--part") o.part=integer(next());
+        else if (arg == "--run-id") o.run_id=next();
+        else if (arg == "--output-format") {
+            const auto value=next(); if(value!="fits" && value!="compact-hdf5") throw std::runtime_error("Output format must be fits or compact-hdf5");
+            o.compact=value=="compact-hdf5";
+        }
         else if (arg == "--thickness") {
             const auto value = integer(next());
             if (value <= 0 || value > std::numeric_limits<int>::max()/4) throw std::runtime_error("Invalid thickness");
@@ -192,6 +226,11 @@ Options parse(int argc, char** argv) {
         vertex = true;
     }
     if (!lightcone::valid_nside(o.nside)) throw std::runtime_error("Nside must be a power of two in 1..2^29");
+    lightcone::pixel_range(o.nside,o.batch,o.subdivision_level,o.part);
+    if(o.subdivision_level && !o.compact) throw std::runtime_error("Subdivision requires compact-hdf5 output");
+    if(o.compact && (o.batch<0 || o.ordering!=lightcone::Ordering::Nested || o.run_id.size()!=64 || o.run_id.find_first_not_of("0123456789abcdef")!=std::string::npos))
+        throw std::runtime_error("Compact output requires an explicit face, NESTED ordering and a lowercase SHA256 --run-id");
+    if(!o.ziggurat && o.io_mode=="tiles") throw std::runtime_error("Tiled I/O requires ziggurat storage");
     if (o.ziggurat && o.batch < 0) throw std::runtime_error("Ziggurat storage requires --batch");
     if (!o.ziggurat && slab_option) throw std::runtime_error("Slab-specific options require --storage ziggurat");
     if (o.info.empty() || !o.thickness || !vertex || !std::isfinite(o.observer_tau) ||
@@ -237,6 +276,28 @@ __global__ void trace_kernel(lightcone::View view, double observer_tau, double t
 using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now()-start).count(); }
 
+// Never call HDF5 from the progress thread. Atomics contain only completed
+// progress, so a blocked read can still be identified in a timed-out job's log.
+class PreloadHeartbeat {
+    std::mutex mutex_; std::condition_variable changed_; bool done_=false;
+    std::thread thread_;
+public:
+    std::atomic<int> field{-1},slot{-1};
+    std::atomic<std::size_t> band{0},bands{0};
+    std::atomic<std::uint64_t> bytes{0};
+    PreloadHeartbeat() { thread_=std::thread([this] {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while(!changed_.wait_for(lock,std::chrono::seconds(30),[this]{return done_;})) {
+            std::ostringstream message;
+            message<<"Preload heartbeat field="<<field.load()<<" slot="<<slot.load()<<" band="<<band.load()<<'/'<<bands.load()
+                   <<" completed requested bytes="<<bytes.load()<<"\n";
+            std::cout<<message.str()<<std::flush;
+        }
+    }); }
+    void stop() { {std::lock_guard<std::mutex> lock(mutex_);done_=true;} changed_.notify_all(); if(thread_.joinable()) thread_.join(); }
+    ~PreloadHeartbeat() {stop();}
+};
+
 int run(const Options& o) {
     std::cout << "ODE corrections: " << raytracer::PHYSICS_JSON << "; redshift tolerance: " << o.redshift_tolerance << '\n';
     if (o.time_derivatives == lightcone::TimeDerivativeMode::Zero)
@@ -274,36 +335,80 @@ int run(const Options& o) {
     if (max_radius+4.0/n > nearest_face)
         std::cerr << "Warning: the footprint/stencil may cross periodic boundaries. Self-overlap can overwrite data and cannot be repaired.\n";
     const std::int64_t npix = 12*o.nside*o.nside;
-    const std::int64_t count = o.batch < 0 ? npix : o.nside*o.nside;
-    const std::int64_t start = o.batch < 0 ? 0 : o.batch*count;
-    lightcone::checked_multiply(static_cast<std::size_t>(npix), sizeof(float));
-    const auto geometry_start = Clock::now();
-    std::vector<double> theta, phi;
-    lightcone::nested_angles(o.nside, o.batch, theta, phi);
+    const auto range=lightcone::pixel_range(o.nside,o.batch,o.subdivision_level,o.part);
+    const auto count=range.count, start=range.first;
+    lightcone::checked_multiply(static_cast<std::size_t>(npix),sizeof(float));
+    const auto geometry_start=Clock::now();
+    std::vector<double> theta,phi;
+    lightcone::range_angles(o.nside,range,theta,phi);
     lightcone::SlabLayout layout;
-    if (o.ziggurat) layout = lightcone::build_ziggurat(n, o.geometry, o.batch, theta, phi,
-                                                     effective_lookback, o.slab_cells, o.padding_cells);
-    const auto geometry_seconds = seconds(geometry_start);
-    const std::size_t voxels = o.ziggurat ? layout.voxels : full_voxels;
-    const std::size_t largest = o.ziggurat ? layout.largest_slab : full_voxels;
-    std::size_t auxiliary = lightcone::checked_multiply(metadata.times.size(), sizeof(double));
-    auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(metadata.background.size(), sizeof(lightcone::BackgroundSegment)));
-    auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(metadata.shells.size(), sizeof(lightcone::RadialSegment)));
-    auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(metadata.slot_offsets.size(), sizeof(int)));
-    auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(4ULL*o.thickness, sizeof(lightcone::GridView)));
-    auxiliary = lightcone::checked_add(auxiliary, lightcone::checked_multiply(layout.slabs.size(), sizeof(lightcone::SlabDescriptor)));
-    auxiliary = lightcone::checked_add(auxiliary, sizeof(int)+sizeof(lightcone::MissDiagnostic));
-    auto estimate = lightcone::estimate_storage(voxels, largest, o.thickness, count, auxiliary);
-    if (o.scalar == lightcone::ScalarSource::PhiChi)
-        estimate.field_staging_bytes = lightcone::checked_multiply(largest, 2*sizeof(float));
-    std::size_t free_bytes, total_bytes;
-    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
-    lightcone::require_storage_memory(estimate, free_bytes);
-    std::cout << "Storage: " << (o.ziggurat ? "ziggurat" : "full") << "; full-volume voxels: " << full_voxels
-              << "; resident voxels: " << voxels << "; slabs: " << layout.slabs.size()
-              << "; field bytes: " << estimate.field_bytes << "; estimated device bytes: " << estimate.device_bytes
-              << "; peak field-staging bytes: " << estimate.field_staging_bytes << '\n';
-    const auto loading_start = Clock::now();
+    if(o.ziggurat) layout=lightcone::build_ziggurat(n,o.geometry,o.batch,theta,phi,effective_lookback,o.slab_cells,o.padding_cells);
+    const bool tiled=o.io_mode=="tiles" || (o.io_mode=="auto" && o.ziggurat && layout.axis==0);
+    const std::string effective_io=tiled?"tiles":"regions";
+    const auto voxels=o.ziggurat?layout.voxels:full_voxels;
+    lightcone::SlabLayout upload_layout=layout;
+    if(!o.ziggurat) {
+        lightcone::SlabDescriptor d{};
+        for(int a=0;a<3;++a) d.extent[a]=n;
+        d.strides[0]=1; d.strides[1]=n; d.strides[2]=static_cast<std::size_t>(n)*n;
+        upload_layout.slabs.push_back(d);
+    }
+    std::array<lightcone::PreloadPlan,4> plans;
+    std::size_t peak_staging=0;
+    for(int field=0;field<4;++field) {
+        const std::size_t bytes=field?6:(o.scalar==lightcone::ScalarSource::PhiChi?8:4);
+        plans[field]=tiled?lightcone::tiled_preload_plan(n,layout,lightcone::preload_tile_height(n,o.io_budget,bytes)):
+                           lightcone::regional_preload_plan(upload_layout);
+        peak_staging=std::max(peak_staging,lightcone::checked_multiply(plans[field].peak_voxels,bytes));
+    }
+    const auto geometry_seconds=seconds(geometry_start);
+    std::size_t auxiliary=lightcone::checked_multiply(metadata.times.size(),sizeof(double));
+    auxiliary=lightcone::checked_add(auxiliary,lightcone::checked_multiply(metadata.background.size(),sizeof(lightcone::BackgroundSegment)));
+    auxiliary=lightcone::checked_add(auxiliary,lightcone::checked_multiply(metadata.shells.size(),sizeof(lightcone::RadialSegment)));
+    auxiliary=lightcone::checked_add(auxiliary,lightcone::checked_multiply(metadata.slot_offsets.size(),sizeof(int)));
+    auxiliary=lightcone::checked_add(auxiliary,lightcone::checked_multiply(4ULL*o.thickness,sizeof(lightcone::GridView)));
+    auxiliary=lightcone::checked_add(auxiliary,lightcone::checked_multiply(layout.slabs.size(),sizeof(lightcone::SlabDescriptor)));
+    auxiliary=lightcone::checked_add(auxiliary,sizeof(int)+sizeof(lightcone::MissDiagnostic));
+    auto estimate=lightcone::estimate_storage(voxels,o.ziggurat?layout.largest_slab:full_voxels,o.thickness,count,auxiliary);
+    estimate.field_staging_bytes=peak_staging;
+    std::size_t free_bytes,total_bytes;
+    cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes));
+    double encoding_seconds=0,transfer_seconds=0,loading_seconds=0,tracing_seconds=0,output_seconds=0;
+    std::array<std::uint64_t,static_cast<int>(lightcone::Status::Count)> totals{};
+    auto metrics=[&](const std::string& stage) {
+        std::ofstream f("run-metrics.json.partial");
+        if(!f) throw std::runtime_error("Cannot write run metrics");
+        f<<std::setprecision(17)<<"{\"schema\":2,\"stage\":\""<<stage<<"\",\"storage\":\""<<(o.ziggurat?"ziggurat":"full")
+         <<"\",\"static_shear_transport\":\""<<raytracer::SHEAR_TRANSPORT_NAME
+         <<"\",\"time_derivatives\":\""<<lightcone::time_derivative_name(o.time_derivatives)
+         <<"\",\"shell_geometry\":\""<<lightcone::geometry_convention_name(o.geometry.convention)
+         <<"\",\"scalar_source\":\""<<lightcone::scalar_source_name(o.scalar)
+         <<"\",\"ordering\":\""<<(o.ordering==lightcone::Ordering::Nested?"NESTED":"RING")
+         <<"\",\"io_mode_requested\":\""<<o.io_mode<<"\",\"io_mode\":\""<<effective_io
+         <<"\",\"output_format\":\""<<(o.compact?"compact-hdf5":"fits")<<"\",\"run_id\":\""<<o.run_id
+         <<"\",\"nside\":"<<o.nside<<",\"face\":"<<o.batch<<",\"subdivision_level\":"<<o.subdivision_level
+         <<",\"part\":"<<o.part<<",\"first_pixel\":"<<start<<",\"pixel_count\":"<<count
+         <<",\"full_voxels\":"<<full_voxels<<",\"resident_voxels\":"<<voxels<<",\"slabs\":"<<layout.slabs.size()
+         <<",\"field_bytes\":"<<estimate.field_bytes<<",\"device_bytes\":"<<estimate.device_bytes
+         <<",\"device_free_bytes\":"<<free_bytes<<",\"device_total_bytes\":"<<total_bytes
+         <<",\"field_staging_bytes\":"<<peak_staging<<",\"io_buffer_bytes\":"<<o.io_budget
+         <<",\"source_payload_bytes\":"<<reader.bytes_read()<<",\"hdf5_read_calls\":"<<reader.read_calls()
+         <<",\"hdf5_seconds\":"<<reader.read_seconds()<<",\"encoding_seconds\":"<<encoding_seconds<<",\"transfer_seconds\":"<<transfer_seconds
+         <<",\"geometry_seconds\":"<<geometry_seconds<<",\"loading_seconds\":"<<loading_seconds
+         <<",\"tracing_seconds\":"<<tracing_seconds<<",\"output_seconds\":"<<output_seconds
+         <<",\"physics\":"<<raytracer::PHYSICS_JSON<<",\"redshift_tolerance\":"<<o.redshift_tolerance
+         <<",\"effective_lookback_cells\":"<<effective_lookback<<",\"residency_misses\":"<<totals[static_cast<int>(lightcone::Status::NotResident)]<<",\"ray_status_counts\":{";
+        for(int s=0;s<static_cast<int>(totals.size());++s) f<<(s?",":"")<<'"'<<lightcone::status_name(static_cast<lightcone::Status>(s))<<"\":"<<totals[s];
+        f<<"}}\n"; f.close(); if(!f) throw std::runtime_error("Cannot finish run metrics");
+        std::filesystem::rename("run-metrics.json.partial","run-metrics.json");
+    };
+    metrics("planned");
+    lightcone::require_storage_memory(estimate,free_bytes);
+    std::cout<<"Storage: "<<(o.ziggurat?"ziggurat":"full")<<"; resident voxels: "<<voxels<<"; estimated device bytes: "<<estimate.device_bytes
+             <<"; free device bytes: "<<free_bytes<<"; I/O: "<<effective_io<<"; peak field staging: "<<peak_staging
+             <<"; NESTED interval: "<<start<<" + "<<count<<std::endl;
+    const auto loading_start=Clock::now();
+    metrics("loading");
     DeviceBuffer<double> times(metadata.times);
     DeviceBuffer<lightcone::BackgroundSegment> background(metadata.background);
     DeviceBuffer<lightcone::RadialSegment> shells(metadata.shells);
@@ -312,98 +417,103 @@ int run(const Options& o) {
     std::vector<DeviceBuffer<float>> potentials;
     std::vector<DeviceBuffer<std::uint16_t>> vectors;
     std::vector<lightcone::GridView> grids;
-    const std::int64_t origin[3] = {0, 0, 0};
-    for (int field = 0; field < 4; ++field) for (int slot = 0; slot < o.thickness; ++slot) {
-        std::cout << "Loading " << reader.filename(field, slot) << '\n';
-        auto grid = lightcone::float_grid(nullptr, n, field, o.staggered);
-        if (field == 0) { potentials.emplace_back(voxels); grid.values = potentials.back().data; }
-        else { vectors.emplace_back(voxels); grid.half_values = vectors.back().data; }
-        const std::size_t regions = o.ziggurat ? layout.slabs.size() : 1;
-        for (std::size_t region = 0; region < regions; ++region) {
-            const auto* read_origin = o.ziggurat ? layout.slabs[region].origin : origin;
-            const auto* read_extent = o.ziggurat ? layout.slabs[region].extent : extent;
-            const auto offset = o.ziggurat ? layout.slabs[region].offset : 0;
-            auto values = reader.read_region(field, slot, read_origin, read_extent);
-            if (field == 0) cuda_check(cudaMemcpy(potentials.back().data+offset, values.data(), values.size()*sizeof(float), cudaMemcpyHostToDevice));
-            else {
-                std::vector<std::uint16_t> packed(values.size());
+    PreloadHeartbeat heartbeat;
+    for(int field=0;field<4;++field) for(int slot=0;slot<o.thickness;++slot) {
+        std::cout<<"Loading "<<reader.filename(field,slot)<<"; bands: "<<plans[field].bands.size()<<std::endl;
+        auto grid=lightcone::float_grid(nullptr,n,field,o.staggered);
+        if(!field) { potentials.emplace_back(voxels); grid.values=potentials.back().data; }
+        else { vectors.emplace_back(voxels); grid.half_values=vectors.back().data; }
+        heartbeat.field=field;heartbeat.slot=slot;heartbeat.bands=plans[field].bands.size();
+        auto last_progress=Clock::now();
+        for(std::size_t band=0;band<plans[field].bands.size();++band) {
+            const auto& b=plans[field].bands[band];
+            heartbeat.band=band+1;
+            auto values=reader.read_region(field,slot,b.origin,b.extent);
+            heartbeat.bytes=reader.bytes_read();
+            std::vector<std::uint16_t> packed;
+            if(field) {
+                const auto encode_start=Clock::now(); packed.resize(values.size());
                 #pragma omp parallel for
-                for (std::size_t i = 0; i < values.size(); ++i) {
-                    const __half_raw value = __float2half(values[i]*134217728.0f);
-                    packed[i] = value.x;
-                }
-                cuda_check(cudaMemcpy(vectors.back().data+offset, packed.data(), packed.size()*sizeof(std::uint16_t), cudaMemcpyHostToDevice));
+                for(std::size_t i=0;i<values.size();++i) { const __half_raw value=__float2half(values[i]*134217728.0f); packed[i]=value.x; }
+                encoding_seconds+=seconds(encode_start);
+            }
+            const auto copy_start=Clock::now();
+            const std::size_t element=field?sizeof(std::uint16_t):sizeof(float);
+            void* source=field?static_cast<void*>(packed.data()):static_cast<void*>(values.data());
+            for(const auto& c:b.copies) {
+                const auto& d=upload_layout.slabs[c.slab];
+                void* dest=field?static_cast<void*>(vectors.back().data+d.offset):static_cast<void*>(potentials.back().data+d.offset);
+                cudaMemcpy3DParms copy{};
+                copy.srcPtr=make_cudaPitchedPtr(source,b.extent[0]*element,b.extent[0]*element,b.extent[1]);
+                copy.dstPtr=make_cudaPitchedPtr(dest,d.extent[0]*element,d.extent[0]*element,d.extent[1]);
+                copy.srcPos=make_cudaPos(c.source[0]*element,c.source[1],c.source[2]);
+                copy.dstPos=make_cudaPos(c.destination[0]*element,c.destination[1],c.destination[2]);
+                copy.extent=make_cudaExtent(c.extent[0]*element,c.extent[1],c.extent[2]); copy.kind=cudaMemcpyHostToDevice;
+                cuda_check(cudaMemcpy3D(&copy));
+            }
+            transfer_seconds+=seconds(copy_start);
+            if(seconds(last_progress)>=30) {
+                std::cout<<"Preload field="<<field<<" slot="<<slot<<" band="<<band+1<<'/'<<plans[field].bands.size()<<" requested bytes="<<reader.bytes_read()<<std::endl;
+                last_progress=Clock::now();
             }
         }
-        grids.push_back(grid);
+        grids.push_back(grid); loading_seconds=seconds(loading_start); metrics("loading");
+        std::cout<<"Loaded field="<<field<<" slot="<<slot<<"; elapsed loading="<<loading_seconds<<" s"<<std::endl;
     }
+    heartbeat.stop();
     DeviceBuffer<lightcone::GridView> device_grids(grids);
-    view = {n, o.thickness, static_cast<int>(metadata.times.size()), o.geometry,
-            times.data, background.data, shells.data, offsets.data, device_grids.data};
-    view.layout = layout.view(); view.layout.slabs = descriptors.data;
-    view.trace_tau_min = lower_tau;
-    view.time_derivatives = o.time_derivatives;
-    view.redshift_tolerance = o.redshift_tolerance;
-    DeviceBuffer<double> device_theta(theta), device_phi(phi);
-    DeviceBuffer<float> maps(lightcone::checked_multiply(count, lightcone::MAP_COUNT));
-    DeviceBuffer<int> device_status(count), first_miss(1);
+    view={n,o.thickness,static_cast<int>(metadata.times.size()),o.geometry,times.data,background.data,shells.data,offsets.data,device_grids.data};
+    view.layout=layout.view(); view.layout.slabs=descriptors.data;
+    view.trace_tau_min=lower_tau; view.time_derivatives=o.time_derivatives; view.redshift_tolerance=o.redshift_tolerance;
+    DeviceBuffer<double> device_theta(theta),device_phi(phi);
+    DeviceBuffer<float> maps(lightcone::checked_multiply(count,lightcone::MAP_COUNT));
+    DeviceBuffer<int> device_status(count),first_miss(1);
     DeviceBuffer<lightcone::MissDiagnostic> missed(1);
-    cuda_check(cudaMemset(first_miss.data, 0, sizeof(int)));
-    const auto loading_seconds = seconds(loading_start);
-    const std::int64_t blocks = (count+63)/64;
-    if (blocks > std::numeric_limits<int>::max()) throw std::runtime_error("Too many rays for a single launch; use batching");
-    const auto tracing_start = Clock::now();
-    trace_kernel<<<static_cast<unsigned>(blocks), 64>>>(view, o.observer_tau, o.target_z, count,
-            device_theta.data, device_phi.data, maps.data, device_status.data, start, first_miss.data, missed.data);
-    cuda_check(cudaGetLastError()); cuda_check(cudaDeviceSynchronize());
-    const auto tracing_seconds = seconds(tracing_start);
-    std::vector<int> statuses(count);
-    cuda_check(cudaMemcpy(statuses.data(), device_status.data, statuses.size()*sizeof(int), cudaMemcpyDeviceToHost));
-    std::array<std::uint64_t, static_cast<int>(lightcone::Status::Count)> totals{};
-    for (int status : statuses) {
-        if (status < 0 || status >= static_cast<int>(totals.size())) throw std::runtime_error("Invalid device status");
-        ++totals[status];
+    cuda_check(cudaMemset(first_miss.data,0,sizeof(int)));
+    loading_seconds=seconds(loading_start);
+    const std::int64_t blocks=(count+63)/64;
+    if(blocks>std::numeric_limits<int>::max()) throw std::runtime_error("Too many rays for a single launch; subdivide the face");
+    metrics("tracing"); std::cout<<"Tracing "<<count<<" rays"<<std::endl;
+    const auto tracing_start=Clock::now();
+    trace_kernel<<<static_cast<unsigned>(blocks),64>>>(view,o.observer_tau,o.target_z,count,device_theta.data,device_phi.data,maps.data,device_status.data,start,first_miss.data,missed.data);
+    cuda_check(cudaGetLastError()); cuda_check(cudaDeviceSynchronize()); tracing_seconds=seconds(tracing_start);
+    std::vector<int> statuses(std::min<std::int64_t>(count,lightcone::OUTPUT_BLOCK));
+    for(std::int64_t offset=0;offset<count;offset+=statuses.size()) {
+        const auto size=static_cast<std::size_t>(std::min<std::int64_t>(statuses.size(),count-offset));
+        cuda_check(cudaMemcpy(statuses.data(),device_status.data+offset,size*sizeof(int),cudaMemcpyDeviceToHost));
+        for(std::size_t i=0;i<size;++i) { const int s=statuses[i]; if(s<0 || s>=static_cast<int>(totals.size())) throw std::runtime_error("Invalid device status"); ++totals[s]; }
     }
-    for (int s = 0; s < static_cast<int>(totals.size()); ++s)
-        std::cout << lightcone::status_name(static_cast<lightcone::Status>(s)) << ": " << totals[s] << '\n';
-    std::cout << "Requested source payload bytes: " << reader.bytes_read() << "; geometry seconds: " << geometry_seconds
-              << "; loading seconds: " << loading_seconds << "; tracing seconds: " << tracing_seconds << '\n';
-    std::ofstream metrics("run-metrics.json");
-    if (!metrics) throw std::runtime_error("Cannot write run-metrics.json");
-    metrics << std::setprecision(17) << "{\"storage\":\"" << (o.ziggurat ? "ziggurat" : "full")
-            << "\",\"static_shear_transport\":\"" << raytracer::SHEAR_TRANSPORT_NAME
-            << "\",\"time_derivatives\":\"" << lightcone::time_derivative_name(o.time_derivatives)
-            << "\",\"shell_geometry\":\"" << lightcone::geometry_convention_name(o.geometry.convention)
-            << "\",\"scalar_source\":\"" << lightcone::scalar_source_name(o.scalar)
-            << "\",\"ordering\":\"" << (o.ordering == lightcone::Ordering::Nested ? "NESTED" : "RING")
-            << "\",\"full_voxels\":" << full_voxels << ",\"resident_voxels\":" << voxels
-            << ",\"slabs\":" << layout.slabs.size() << ",\"field_bytes\":" << estimate.field_bytes
-            << ",\"device_bytes\":" << estimate.device_bytes << ",\"field_staging_bytes\":" << estimate.field_staging_bytes
-            << ",\"source_payload_bytes\":" << reader.bytes_read() << ",\"geometry_seconds\":" << geometry_seconds
-            << ",\"loading_seconds\":" << loading_seconds << ",\"tracing_seconds\":" << tracing_seconds
-            << ",\"physics\":" << raytracer::PHYSICS_JSON << ",\"redshift_tolerance\":" << o.redshift_tolerance
-            << ",\"effective_lookback_cells\":" << effective_lookback << ",\"residency_misses\":"
-            << totals[static_cast<int>(lightcone::Status::NotResident)] << ",\"ray_status_counts\":{";
-    for (int s = 0; s < static_cast<int>(totals.size()); ++s)
-        metrics << (s ? "," : "") << '"' << lightcone::status_name(static_cast<lightcone::Status>(s)) << "\":" << totals[s];
-    metrics << "}}\n";
-    metrics.close();
-    if (!metrics) throw std::runtime_error("Cannot finish run-metrics.json");
-    if (o.ziggurat && totals[static_cast<int>(lightcone::Status::NotResident)]) {
-        lightcone::MissDiagnostic miss;
-        cuda_check(cudaMemcpy(&miss, missed.data, sizeof(miss), cudaMemcpyDeviceToHost));
-        std::cerr << "Missing resident node: (" << miss.node[0] << ',' << miss.node[1] << ',' << miss.node[2]
-                  << "), NESTED pixel=" << miss.nested_pixel << ", field=" << miss.field << ", slot=" << miss.slot
-                  << ", tau=" << std::setprecision(17) << miss.tau << '\n';
-        throw std::runtime_error("Ziggurat residency failure; no FITS maps written. Increase --padding-cells or check the look-back cap. No automatic retry was performed.");
+    for(int s=0;s<static_cast<int>(totals.size());++s) std::cout<<lightcone::status_name(static_cast<lightcone::Status>(s))<<": "<<totals[s]<<'\n';
+    metrics("traced");
+    if(o.ziggurat && totals[static_cast<int>(lightcone::Status::NotResident)]) {
+        lightcone::MissDiagnostic miss; cuda_check(cudaMemcpy(&miss,missed.data,sizeof(miss),cudaMemcpyDeviceToHost));
+        std::cerr<<"Missing resident node: ("<<miss.node[0]<<','<<miss.node[1]<<','<<miss.node[2]<<"), NESTED pixel="<<miss.nested_pixel<<", field="<<miss.field<<", slot="<<miss.slot<<", tau="<<std::setprecision(17)<<miss.tau<<'\n';
+        throw std::runtime_error("Ziggurat residency failure; no output published. Increase --padding-cells or check the look-back cap. No automatic retry.");
     }
-    std::vector<float> output(npix, 0.0f);
-    for (int map = 0; map < lightcone::MAP_COUNT; ++map) {
-        cuda_check(cudaMemcpy(output.data()+start, maps.data+map*count, count*sizeof(float), cudaMemcpyDeviceToHost));
-        const int output_batch = o.batch < 0 ? 0 : o.batch;
-        const std::string filename = std::string(lightcone::MAP_NAMES[map])+"_batch"+std::to_string(output_batch)+".fits";
-        lightcone::write_nested_map(output, o.nside, o.ordering, filename);
+    std::cout<<"Requested source payload bytes: "<<reader.bytes_read()<<"; loading seconds: "<<loading_seconds<<"; tracing seconds: "<<tracing_seconds<<std::endl;
+    metrics("writing"); const auto output_start=Clock::now();
+    if(o.compact) {
+        lightcone::PartInfo info{o.nside,start,count,o.part,o.batch,o.subdivision_level,o.target_z,o.redshift_tolerance,o.run_id,raytracer::PHYSICS_JSON};
+        lightcone::PartWriter writer("ray-part.h5",info);
+        std::vector<float> output(std::min<std::int64_t>(count,lightcone::OUTPUT_BLOCK));
+        for(int map=0;map<lightcone::MAP_COUNT;++map) for(std::int64_t offset=0;offset<count;offset+=output.size()) {
+            const auto size=static_cast<std::size_t>(std::min<std::int64_t>(output.size(),count-offset));
+            cuda_check(cudaMemcpy(output.data(),maps.data+map*count+offset,size*sizeof(float),cudaMemcpyDeviceToHost)); writer.map(map,offset,size,output.data());
+        }
+        for(std::int64_t offset=0;offset<count;offset+=statuses.size()) {
+            const auto size=static_cast<std::size_t>(std::min<std::int64_t>(statuses.size(),count-offset));
+            cuda_check(cudaMemcpy(statuses.data(),device_status.data+offset,size*sizeof(int),cudaMemcpyDeviceToHost)); writer.statuses(offset,size,statuses.data());
+        }
+        writer.finish();
+    } else {
+        std::vector<float> output(npix,0.0f);
+        for(int map=0;map<lightcone::MAP_COUNT;++map) {
+            cuda_check(cudaMemcpy(output.data()+start,maps.data+map*count,count*sizeof(float),cudaMemcpyDeviceToHost));
+            const auto filename=std::string(lightcone::MAP_NAMES[map])+"_batch"+std::to_string(o.batch<0?0:o.batch)+".fits";
+            lightcone::write_nested_map(output,o.nside,o.ordering,filename);
+        }
     }
+    output_seconds=seconds(output_start); metrics("complete");
     return 0;
 }
 } // namespace

@@ -26,3 +26,7 @@
 # Local reference copies; the documentation links to their arXiv versions.
 /2002.04024v2.pdf
 /2603.24179v2.pdf
+
+/tests/lightcone-preload-tests
+/tests/lightcone-preload-gpu
+/tests/lightcone-preload-gpu-legacy

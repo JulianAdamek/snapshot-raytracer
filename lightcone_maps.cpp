@@ -17,14 +17,27 @@ void check_map(const std::vector<float>& data, std::int64_t nside) {
 }
 }
 void nested_angles(std::int64_t nside, int batch, std::vector<double>& theta, std::vector<double>& phi) {
-    const auto all = pixel_count(nside);
-    if (batch < -1 || batch > 11) throw std::runtime_error("Invalid base face");
-    const auto count = batch < 0 ? all : all/12;
-    const auto start = batch < 0 ? 0 : batch*count;
+    range_angles(nside,pixel_range(nside,batch),theta,phi);
+}
+PixelRange pixel_range(std::int64_t nside,int batch,int level,std::int64_t part) {
+    const auto all=pixel_count(nside);
+    if(batch < -1 || batch > 11 || level<0 || part<0) throw std::runtime_error("Invalid base face or subdivision");
+    int order=0; for(auto n=nside;n>1;n/=2) ++order;
+    if(level>order || (batch<0 && (level || part))) throw std::runtime_error("Subdivision requires an explicit face and level <= log2(Nside)");
+    const std::int64_t parts=1LL<<(2*level);
+    if(part>=parts) throw std::runtime_error("Part is outside the subdivision");
+    const auto count=batch<0 ? static_cast<std::int64_t>(all) : nside*nside/parts;
+    return {batch<0 ? 0 : batch*nside*nside+part*count,count};
+}
+void range_angles(std::int64_t nside,PixelRange range,std::vector<double>& theta,std::vector<double>& phi) {
+    const auto all=pixel_count(nside);
+    if(range.first<0 || range.count<=0 || static_cast<std::uint64_t>(range.first)>all || static_cast<std::uint64_t>(range.count)>all-range.first)
+        throw std::runtime_error("Invalid NESTED interval");
+    const auto count=range.count, start=range.first;
     checked_multiply(count, sizeof(double));
     theta.resize(count); phi.resize(count);
     #pragma omp parallel for
-    for (std::size_t i = 0; i < count; ++i) pix2ang_nest64(nside, start+i, &theta[i], &phi[i]);
+    for (std::int64_t i = 0; i < count; ++i) pix2ang_nest64(nside, start+i, &theta[i], &phi[i]);
 }
 std::vector<float> ring_to_nested(const std::vector<float>& data, std::int64_t nside) {
     check_map(data, nside);

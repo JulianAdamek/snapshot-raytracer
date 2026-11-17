@@ -171,6 +171,22 @@ detected. Possible periodic self-overlap produces warnings, not rejection;
 overwritten simulation data cannot be recovered. Missing spatial or temporal
 coverage anywhere in a full stencil invalidates that ray.
 
+## Tiled preloading and smaller ray batches
+
+`--io-mode auto` now uses bounded full-x tile reads for x-oriented ziggurats,
+which avoids fragmented reads from contiguous HDF5 cubes. The original regional
+path remains available with `--io-mode regions`; `--io-mode tiles` forces the new
+loader for validation. `--io-buffer-mib` defaults to 256 MiB for numeric tile
+buffers. These options do not change the spatial layout or sampling equations.
+
+For smaller independent GPU launches, use `--subdivision-level L --part P` with
+an explicit `--batch`, `--output-format compact-hdf5` and `--run-id SHA256`.
+There are 4^L contiguous NESTED regions per face. Nside and pixel directions stay
+unchanged. Compact output stores only the selected pixels and ray statuses;
+the existing full-sized FITS output remains the default for unsplit commands.
+See the [resumable Alps workflow](tiled-campaign-alps.md) for full interfaces,
+compact format, assembly, validation and migration of the saved pilot.
+
 ## Outputs and validation
 
 All maps are float32, full-sized HEALPix FITS files. Face runs are zero outside

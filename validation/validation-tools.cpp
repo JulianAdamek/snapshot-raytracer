@@ -1,5 +1,6 @@
 #include "lightcone_ray.hpp"
 #include "lightcone_maps.hpp"
+#include "lightcone_parts.hpp"
 #include <cfloat>
 #include <chealpix.h>
 #include <fitsio.h>
@@ -366,7 +367,19 @@ int main(int argc, char** argv) {
     try {
         require(argc >= 2, "Modes: prepare, prepare-static, check-face, check-fixture, compare, compare-strict, compare-frozen, assemble, self-test");
         const std::string mode = argv[1];
-        if (mode == "prepare" && argc == 6) prepare(argv[2], argv[3], argv[4], std::stoi(argv[5]));
+        if (mode == "check-part" && argc==3) {
+            lightcone::check_part(argv[2]); const auto i=lightcone::inspect_part(argv[2]);
+            std::cout<<"{\"pass\":true,\"nside\":"<<i.nside<<",\"first\":"<<i.first<<",\"count\":"<<i.count
+                     <<",\"face\":"<<i.face<<",\"level\":"<<i.level<<",\"part\":"<<i.part<<",\"run_id\":\""<<i.run_id<<"\",\"physics\":"<<i.physics<<"}\n";
+        }
+        else if(mode=="compare-part" && argc==4) { lightcone::compare_part(argv[2],argv[3]);std::cout<<"{\"pass\":true}\n"; }
+        else if(mode=="assemble-parts" && argc>=4) { std::vector<std::string> paths;for(int i=3;i<argc;++i) paths.push_back(argv[i]);lightcone::assemble_parts(paths,argv[2]);std::cout<<"{\"pass\":true}\n"; }
+        else if(mode=="import-face" && argc==10) {
+            const auto n=std::stoll(argv[4]);const int face=std::stoi(argv[5]);const auto r=lightcone::pixel_range(n,face);
+            lightcone::PartInfo i{n,r.first,r.count,0,face,0,std::stod(argv[6]),std::stod(argv[7]),argv[8],argv[9]};
+            lightcone::import_face(argv[2],argv[3],i);std::cout<<"{\"pass\":true}\n";
+        }
+        else if (mode == "prepare" && argc == 6) prepare(argv[2], argv[3], argv[4], std::stoi(argv[5]));
         else if (mode == "prepare-static" && argc == 6) prepare(argv[2], argv[3], argv[4], std::stoi(argv[5]), 1);
         else if (mode == "check-face" && argc == 6) check_face(argv[2],std::stoll(argv[3]),std::stoi(argv[4]),std::stod(argv[5]));
         else if (mode == "check-fixture" && argc == 6) check_fixture(argv[2], std::stoi(argv[3]), std::stod(argv[4]), std::stod(argv[5]));
